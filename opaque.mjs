@@ -530,7 +530,7 @@ export async function opaqueFinishLogin({
     state.blind,
     ptFrom(evaluatedBytes),
   );
-  const ksfSalt = options.ksfSalt ?? state.ksfSalt ?? randomBytes(Nh);
+  const ksfSalt = options.ksfSalt ?? state.ksfSalt ?? KSF_SALT;
   const ksfLen = options.ksfLength ?? state.ksfLength;
   const ksfParams = options.ksfParams ?? state.ksfParams;
   const stretched = opaqueStretch(oprfOutput, ksfSalt, ksfLen, ksfParams);
@@ -615,6 +615,41 @@ export async function opaqueFinishLogin({
   const expectedServerMac = hmac(sha512, serverMacKey, preambleHash);
   const transcript3 = sha512(concatBytes(preamble, expectedServerMac));
   const clientMac = hmac(sha512, clientMacKey, transcript3);
+
+  if (!ctEq(expectedServerMac, serverMac)) {
+    throw new Error("server MAC mismatch");
+  }
+
+  // --- DEBUG LOGS ---
+  const toHex = (buf) =>
+    Array.from(buf)
+      .map((b) => b.toString(16).padStart(2, "0"))
+      .join("");
+  const decodeSafe = (buf) => {
+    try {
+      return new TextDecoder().decode(buf);
+    } catch {
+      return "binary";
+    }
+  };
+
+  console.log("=== OPAQUE MAC DEBUG ===");
+  console.log(
+    "1. effClientId:",
+    toHex(effClientId),
+    `(${decodeSafe(effClientId)})`,
+  );
+  console.log(
+    "2. effServerId:",
+    toHex(effServerId),
+    `(${decodeSafe(effServerId)})`,
+  );
+  console.log("3. context:", toHex(effContext));
+  console.log("4. ikm:", toHex(ikm));
+  console.log("5. preambleHash:", toHex(preambleHash));
+  console.log("6. expectedServerMac:", toHex(expectedServerMac));
+  console.log("7. serverMac (received):", toHex(serverMac));
+  console.log("========================");
 
   // 6. Verify Server MAC
   if (!ctEq(expectedServerMac, serverMac)) {

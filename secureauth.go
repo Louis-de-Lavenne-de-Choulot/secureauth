@@ -1,37 +1,14 @@
-// Package secureauth implements the SecureAuthAndCommHandler library.
-//
-// Architecture (post-remediation):
-//   - The Go server is a thin storage and session layer. It never runs OPAQUE,
-//     never sees a password, an OPAQUE export key, or a plaintext RSA private
-//     key. All OPAQUE cryptography is performed in the browser via
-//     @serenity-kit/opaque (WASM).
-//   - The operator supplies a 171-byte opaque-ke server setup via
-//     InitOptions.OPAQUE_SERVER_SETUP. The server serves it verbatim; it does
-//     not interpret it cryptographically.
-//   - Account enumeration resistance: GET /api/registration-record always
-//     returns a syntactically valid record. For unknown users, a
-//     deterministic fake (HMAC-SHA256(masterKey, "fake-record:" || username))
-//     is returned, and a matching fake userIdentifier is derived so the
-//     client's OPAQUE finish fails identically to a wrong password.
-//   - CSRF: true double-submit. The token returned by /api/login2 is sent in
-//     X-CSRF-Token; the session-bound HMAC lives in a readable cookie. The
-//     token is NOT stored server-side.
-//   - Channel binding: tls-server-end-point (SHA-256 of the server cert DER)
-//     is mixed into the session key on both sides.
-//
-// Security invariants enforced throughout this file:
-//   - Every secret comparison is constant-time via crypto/subtle.
-//   - Every nonce is 192-bit random from crypto/rand.
-//   - The audit chain is written under a mutex so concurrent writers cannot
-//     fork it.
 package secureauth
 
 import (
 	"context"
+	"crypto"
 	"crypto/hmac"
 	"crypto/rand"
+	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/subtle"
+	"crypto/x509"
 	"database/sql"
 	_ "embed"
 	"encoding/base64"
@@ -42,11 +19,15 @@ import (
 	"html/template"
 	"io"
 	"log"
+	"net"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/bytemare/ksf"
+	"github.com/bytemare/opaque"
 	"golang.org/x/crypto/chacha20poly1305"
 	"golang.org/x/crypto/curve25519"
 	"golang.org/x/crypto/hkdf"
@@ -59,55 +40,49 @@ import (
 //go:embed secureauth.mjs
 var secureAuthJS string
 
-// InitOptions configures Init.
+//go:embed opaque.mjs
+var opaqueJS string
+
+var (
+	aadOPAQUEKey  = []byte("secureauth:opaque-server-key-material:v1")
+	aadSessionKey = []byte("secureauth:session-key:v1")
+)
+
+var hkdfSalt = []byte("SecureAuth HKDF salt v1")
+
 type InitOptions struct {
-	// AdminPassword, if non-empty, is logged once and the operator is expected
-	// to register the SuperAdmin via the client OPAQUE flow. Never stored.
-	AdminPassword string
-
-	// GenerateRandomAdminPassword, if true, generates a cryptographically
-	// random one-time password, prints it once to the console, and expects
-	// the operator to register the SuperAdmin via the client OPAQUE flow.
-	GenerateRandomAdminPassword bool
-
-	// MasterKey encrypts server-side secrets (session keys) at rest. 32 bytes.
-	// If nil, Init generates one and logs it; the caller is responsible for
-	// persisting it in an HSM in production.
-	MasterKey []byte
-
-	// ServerID is the OPAQUE server identity. Defaults to "secureauth".
-	ServerID string
-
-	// OPAQUE_SERVER_SETUP is a 171-byte opaque-ke server setup, generated
-	// once by an operator using the @serenity-kit/opaque CLI outside this
-	// library, and stored in an HSM. Required.
-	OPAQUE_SERVER_SETUP string
-
-	// TLSCertificate is the DER-encoded server certificate used for
-	// tls-server-end-point channel binding (RFC 5929). Optional; if omitted,
-	// channel binding is disabled.
+	MasterKey      []byte
+	ServerID       string
+	BootstrapToken string
 	TLSCertificate []byte
+	TrustedProxies []string
 }
 
-// SecureAuth is the handler returned by SecureAuthAndCommHandler.
 type SecureAuth struct {
-	db          *sql.DB
-	masterKey   []byte
-	serverID    []byte
-	opaqueSetup []byte // 171 bytes
-	tlsEndPoint []byte // SHA-256(cert DER) or nil
+	db             *sql.DB
+	masterKey      []byte
+	serverID       []byte
+	opaqueConf     *opaque.Configuration
+	opaqueServer   *opaque.Server
+	tlsEndPoint    []byte
+	bootstrapToken []byte
+
+	trustedProxies []*net.IPNet
 
 	tplLogin, tplUsers, tplRoles, tplAuthorizations *template.Template
 
-	rl      *rateLimiter
-	auditMu sync.Mutex
+	rl          *rateLimiter
+	auditMu     sync.Mutex
+	bootstrapMu sync.Mutex
 
 	sessionTTL      time.Duration
 	loginAttemptTTL time.Duration
 }
 
+const maxBodyBytes = 256 * 1024
+
 // ---------------------------------------------------------------------------
-// Table names (obfuscated per spec §3)
+// Table names
 // ---------------------------------------------------------------------------
 
 const (
@@ -121,19 +96,21 @@ const (
 	tblSessions       = "_secureauth_sessions_9f3a"
 	tblAudit          = "_secureauth_audit_9f3a"
 	tblLoginAttempts  = "_secureauth_login_attempts_9f3a"
-	tblThresholdCT    = "_secureauth_threshold_ct_9f3a"
-	tblThresholdParts = "_secureauth_threshold_parts_9f3a"
+	tblPendingRegs    = "_secureauth_pending_regs_9f3a"
+	tblEncryptedData  = "_secureauth_encrypted_data_9f3a"
+	tblBootstrap      = "_secureauth_bootstrap_9f3a"
 )
 
 // ---------------------------------------------------------------------------
 // Init
 // ---------------------------------------------------------------------------
 
-// Init creates all required tables and seeds roles and authorizations.
-// It validates the operator-supplied OPAQUE setup but does not interpret it.
 func Init(dbdriver string, dsn string, opts InitOptions) (*SecureAuth, error) {
-	if len(opts.OPAQUE_SERVER_SETUP) != 171 {
-		return nil, errors.New("secureauth: OPAQUE_SERVER_SETUP must be exactly 171 bytes")
+	if len(opts.MasterKey) != 32 {
+		return nil, errors.New("secureauth: MasterKey must be exactly 32 bytes")
+	}
+	if len(opts.TLSCertificate) == 0 {
+		return nil, errors.New("secureauth: TLSCertificate is required for channel binding")
 	}
 
 	db, err := sql.Open(dbdriver, dsn)
@@ -149,20 +126,9 @@ func Init(dbdriver string, dsn string, opts InitOptions) (*SecureAuth, error) {
 		sessionTTL:      30 * time.Minute,
 		loginAttemptTTL: 2 * time.Minute,
 		rl:              newRateLimiter(),
-		opaqueSetup:     []byte(opts.OPAQUE_SERVER_SETUP),
 	}
-
-	if opts.MasterKey != nil {
-		if len(opts.MasterKey) != 32 {
-			return nil, errors.New("secureauth: MasterKey must be 32 bytes")
-		}
-		sa.masterKey = make([]byte, 32)
-		copy(sa.masterKey, opts.MasterKey)
-	} else {
-		sa.masterKey = randomBytes(32)
-		log.Printf("secureauth: generated master key (store in HSM): %s",
-			hex.EncodeToString(sa.masterKey))
-	}
+	sa.masterKey = make([]byte, 32)
+	copy(sa.masterKey, opts.MasterKey)
 
 	if opts.ServerID != "" {
 		sa.serverID = []byte(opts.ServerID)
@@ -170,10 +136,41 @@ func Init(dbdriver string, dsn string, opts InitOptions) (*SecureAuth, error) {
 		sa.serverID = []byte("secureauth")
 	}
 
-	if len(opts.TLSCertificate) > 0 {
-		h := sha256.Sum256(opts.TLSCertificate)
-		sa.tlsEndPoint = h[:]
+	for _, cidr := range opts.TrustedProxies {
+		_, netw, err := net.ParseCIDR(cidr)
+		if err != nil {
+			return nil, fmt.Errorf("secureauth: bad TrustedProxies CIDR %q: %w", cidr, err)
+		}
+		sa.trustedProxies = append(sa.trustedProxies, netw)
 	}
+
+	h := sha256.Sum256(opts.TLSCertificate)
+	sa.tlsEndPoint = h[:]
+
+	if opts.BootstrapToken == "" {
+		opts.BootstrapToken = base64.RawURLEncoding.EncodeToString(randomBytes(24))
+		log.Printf("secureauth: generated bootstrap token (use X-Bootstrap-Token to create the first user): %s", opts.BootstrapToken)
+	}
+	sa.bootstrapToken = []byte(opts.BootstrapToken)
+
+	conf := &opaque.Configuration{
+		OPRF: opaque.RistrettoSha512,
+		AKE:  opaque.RistrettoSha512,
+		KSF:  ksf.Argon2id,
+		KDF:  crypto.SHA512,
+		MAC:  crypto.SHA512,
+		Hash: crypto.SHA512,
+		// Non-nil empty slice so bytemare emits the I2OSP(len(context), 2)
+		// || context field inside the OPAQUE-3DH preamble.
+		Context: []byte{},
+	}
+	sa.opaqueConf = conf
+
+	srv, err := conf.Server()
+	if err != nil {
+		return nil, fmt.Errorf("secureauth: instantiate OPAQUE server: %w", err)
+	}
+	sa.opaqueServer = srv
 
 	if err := sa.createTables(); err != nil {
 		return nil, err
@@ -181,16 +178,61 @@ func Init(dbdriver string, dsn string, opts InitOptions) (*SecureAuth, error) {
 	if err := sa.seedRoles(); err != nil {
 		return nil, err
 	}
-
-	if opts.GenerateRandomAdminPassword {
-		pw := base64.RawURLEncoding.EncodeToString(randomBytes(24))
-		log.Printf("secureauth: generated SuperAdmin one-time password (change on first login): %s", pw)
+	if err := sa.loadOrGenerateOPAQUEKeyMaterial(); err != nil {
+		return nil, err
 	}
-	if opts.AdminPassword != "" {
-		log.Printf("secureauth: AdminPassword provided; register the SuperAdmin via the client OPAQUE flow")
+
+	if err := sa.installDefaultTemplates(); err != nil {
+		return nil, err
+	}
+
+	if err := sa.maybeProvisionFirstAdmin(); err != nil {
+		return nil, err
 	}
 
 	return sa, nil
+}
+
+func (sa *SecureAuth) loadOrGenerateOPAQUEKeyMaterial() error {
+	var sealed []byte
+	err := sa.db.QueryRow(
+		`SELECT opaque_server_key_material FROM ` + tblServerKeys + ` WHERE id = 1`,
+	).Scan(&sealed)
+
+	if err == nil && len(sealed) > 0 {
+		raw, err := sa.open(sealed, aadOPAQUEKey)
+		if err != nil {
+			return fmt.Errorf("secureauth: decrypt server key material: %w", err)
+		}
+		skm, err := sa.opaqueConf.DecodeServerKeyMaterial(raw)
+		if err != nil {
+			return fmt.Errorf("secureauth: decode server key material: %w", err)
+		}
+		return sa.opaqueServer.SetKeyMaterial(skm)
+	}
+	if err != nil && err != sql.ErrNoRows {
+		return fmt.Errorf("secureauth: load server key material: %w", err)
+	}
+
+	priv, pub := sa.opaqueConf.KeyGen()
+	skm := &opaque.ServerKeyMaterial{
+		PrivateKey:     priv,
+		PublicKeyBytes: pub.Encode(),
+		OPRFGlobalSeed: sa.opaqueConf.GenerateOPRFSeed(),
+		Identity:       sa.serverID,
+	}
+	sealed, err = sa.seal(skm.Encode(), aadOPAQUEKey)
+	if err != nil {
+		return fmt.Errorf("secureauth: seal server key material: %w", err)
+	}
+	_, err = sa.db.Exec(
+		`UPDATE `+tblServerKeys+` SET opaque_server_key_material = ? WHERE id = 1`,
+		sealed,
+	)
+	if err != nil {
+		return fmt.Errorf("secureauth: persist server key material: %w", err)
+	}
+	return sa.opaqueServer.SetKeyMaterial(skm)
 }
 
 func (sa *SecureAuth) createTables() error {
@@ -198,16 +240,24 @@ func (sa *SecureAuth) createTables() error {
 		`CREATE TABLE IF NOT EXISTS ` + tblUsers + ` (
 			username TEXT PRIMARY KEY,
 			opaque_registration_record BLOB NOT NULL,
+			opaque_credential_id BLOB NOT NULL,
 			rsa_public_key BLOB NOT NULL,
 			encrypted_rsa_private_key BLOB NOT NULL,
 			private_key_nonce BLOB NOT NULL,
 			private_key_salt BLOB NOT NULL,
 			private_key_kdf_info TEXT,
+			rsa_signing_public_key BLOB,
+			encrypted_rsa_signing_private_key BLOB,
+			signing_key_nonce BLOB,
+			signing_key_salt BLOB,
+			signing_key_kdf_info TEXT,
+			ksf_salt BLOB,
 			created_at TIMESTAMP NOT NULL,
 			updated_at TIMESTAMP NOT NULL
 		)`,
 		`CREATE TABLE IF NOT EXISTS ` + tblServerKeys + ` (
 			id INTEGER PRIMARY KEY CHECK (id = 1),
+			opaque_server_key_material BLOB,
 			created_at TIMESTAMP NOT NULL,
 			rotated_at TIMESTAMP
 		)`,
@@ -216,14 +266,11 @@ func (sa *SecureAuth) createTables() error {
 			authorization_id TEXT NOT NULL,
 			wrapped_key BLOB NOT NULL,
 			admin_signature BLOB NOT NULL,
-			share_index INTEGER,
-			threshold INTEGER,
-			total_shares INTEGER,
 			key_version INTEGER NOT NULL DEFAULT 1,
 			created_at TIMESTAMP NOT NULL,
 			revoked_at TIMESTAMP,
 			revocation_reason TEXT,
-			PRIMARY KEY (user_id, authorization_id, share_index, key_version)
+			PRIMARY KEY (user_id, authorization_id, key_version)
 		)`,
 		`CREATE TABLE IF NOT EXISTS ` + tblRoles + ` (
 			id TEXT PRIMARY KEY,
@@ -233,9 +280,7 @@ func (sa *SecureAuth) createTables() error {
 		`CREATE TABLE IF NOT EXISTS ` + tblAuthorizations + ` (
 			id TEXT PRIMARY KEY,
 			name TEXT UNIQUE NOT NULL,
-			description TEXT,
-			is_threshold INTEGER NOT NULL DEFAULT 0,
-			public_key BLOB
+			description TEXT
 		)`,
 		`CREATE TABLE IF NOT EXISTS ` + tblRoleAuth + ` (
 			role_id TEXT NOT NULL,
@@ -254,6 +299,7 @@ func (sa *SecureAuth) createTables() error {
 			csrf_token TEXT NOT NULL,
 			created_at TIMESTAMP NOT NULL,
 			expires_at TIMESTAMP NOT NULL,
+			paake_transcript_hash BLOB,
 			client_ephemeral_public_key BLOB,
 			server_ephemeral_public_key BLOB
 		)`,
@@ -270,28 +316,40 @@ func (sa *SecureAuth) createTables() error {
 			entry_hash BLOB NOT NULL
 		)`,
 		`CREATE TABLE IF NOT EXISTS ` + tblLoginAttempts + ` (
-			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			id TEXT PRIMARY KEY,
 			username TEXT NOT NULL,
+			credential_id BLOB NOT NULL,
+			client_mac BLOB NOT NULL,
+			session_secret BLOB NOT NULL,
+			transcript_hash BLOB NOT NULL,
 			created_at TIMESTAMP NOT NULL,
 			expires_at TIMESTAMP NOT NULL
 		)`,
-		`CREATE TABLE IF NOT EXISTS ` + tblThresholdCT + ` (
+		`CREATE TABLE IF NOT EXISTS ` + tblPendingRegs + ` (
+			id TEXT PRIMARY KEY,
+			username TEXT NOT NULL,
+			credential_id BLOB NOT NULL,
+			created_at TIMESTAMP NOT NULL,
+			expires_at TIMESTAMP NOT NULL
+		)`,
+		`CREATE TABLE IF NOT EXISTS ` + tblEncryptedData + ` (
 			id TEXT PRIMARY KEY,
 			authorization_id TEXT NOT NULL,
-			key_version INTEGER NOT NULL,
-			c1 BLOB NOT NULL,
-			c2 BLOB NOT NULL,
-			ciphertext BLOB NOT NULL,
+			owner_id TEXT NOT NULL,
+			key_version INTEGER NOT NULL DEFAULT 1,
 			nonce BLOB NOT NULL,
-			created_at TIMESTAMP NOT NULL
-		)`,
-		`CREATE TABLE IF NOT EXISTS ` + tblThresholdParts + ` (
-			ciphertext_id TEXT NOT NULL,
-			share_index INTEGER NOT NULL,
-			user_id TEXT NOT NULL,
-			partial BLOB NOT NULL,
+			ciphertext BLOB NOT NULL,
+			label TEXT,
 			created_at TIMESTAMP NOT NULL,
-			PRIMARY KEY (ciphertext_id, share_index)
+			updated_at TIMESTAMP NOT NULL
+		)`,
+		`CREATE TABLE IF NOT EXISTS ` + tblBootstrap + ` (
+			id INTEGER PRIMARY KEY CHECK (id = 1),
+			username TEXT NOT NULL,
+			sealed_password BLOB NOT NULL,
+			sealed_masterkeys BLOB,
+			consumed INTEGER NOT NULL DEFAULT 0,
+			created_at TIMESTAMP NOT NULL
 		)`,
 	}
 	for _, s := range stmts {
@@ -299,7 +357,22 @@ func (sa *SecureAuth) createTables() error {
 			return fmt.Errorf("secureauth: create table: %w", err)
 		}
 	}
-	// Ensure the singleton server-keys row exists (metadata only).
+
+	migrations := []string{
+		`ALTER TABLE ` + tblUsers + ` ADD COLUMN opaque_credential_id BLOB`,
+		`ALTER TABLE ` + tblUsers + ` ADD COLUMN rsa_signing_public_key BLOB`,
+		`ALTER TABLE ` + tblUsers + ` ADD COLUMN encrypted_rsa_signing_private_key BLOB`,
+		`ALTER TABLE ` + tblUsers + ` ADD COLUMN signing_key_nonce BLOB`,
+		`ALTER TABLE ` + tblUsers + ` ADD COLUMN signing_key_salt BLOB`,
+		`ALTER TABLE ` + tblUsers + ` ADD COLUMN signing_key_kdf_info TEXT`,
+		`ALTER TABLE ` + tblUsers + ` ADD COLUMN ksf_salt BLOB`,
+		`ALTER TABLE ` + tblSessions + ` ADD COLUMN paake_transcript_hash BLOB`,
+		`ALTER TABLE ` + tblServerKeys + ` ADD COLUMN opaque_server_key_material BLOB`,
+	}
+	for _, m := range migrations {
+		_, _ = sa.db.Exec(m)
+	}
+
 	_, _ = sa.db.Exec(
 		`INSERT OR IGNORE INTO `+tblServerKeys+` (id, created_at) VALUES (1, ?)`,
 		time.Now().UTC(),
@@ -307,8 +380,6 @@ func (sa *SecureAuth) createTables() error {
 	return nil
 }
 
-// seedRoles creates the four preset roles and their authorizations as metadata
-// only (§4, §8). No authorization keys are generated server-side.
 func (sa *SecureAuth) seedRoles() error {
 	presets := []struct {
 		role           string
@@ -345,8 +416,8 @@ func (sa *SecureAuth) seedRoles() error {
 			authID := "auth-" + a
 			_, err = sa.db.Exec(
 				`INSERT OR IGNORE INTO `+tblAuthorizations+`
-				 (id, name, description, is_threshold)
-				 VALUES (?, ?, ?, 0)`, authID, a, "Preset authorization "+a,
+				 (id, name, description)
+				 VALUES (?, ?, ?)`, authID, a, "Preset authorization "+a,
 			)
 			if err != nil {
 				return err
@@ -364,6 +435,106 @@ func (sa *SecureAuth) seedRoles() error {
 }
 
 // ---------------------------------------------------------------------------
+// First-admin bootstrap
+// ---------------------------------------------------------------------------
+
+func (sa *SecureAuth) maybeProvisionFirstAdmin() error {
+	var count int
+	_ = sa.db.QueryRow(`SELECT COUNT(*) FROM ` + tblUsers).Scan(&count)
+	if count > 0 {
+		return nil
+	}
+
+	_, _ = sa.db.Exec(`CREATE TABLE IF NOT EXISTS ` + tblBootstrap + ` (
+		id INTEGER PRIMARY KEY CHECK (id = 1),
+		username TEXT NOT NULL,
+		sealed_password BLOB NOT NULL,
+		sealed_masterkeys BLOB,
+		consumed INTEGER NOT NULL DEFAULT 0,
+		created_at TIMESTAMP NOT NULL
+	)`)
+
+	var bsCount int
+	_ = sa.db.QueryRow(`SELECT COUNT(*) FROM ` + tblBootstrap + ` WHERE id = 1 AND consumed = 0`).Scan(&bsCount)
+	if bsCount > 0 {
+		return nil
+	}
+
+	username := os.Getenv("SECUREAUTH_ADMIN_USERNAME")
+	password := os.Getenv("SECUREAUTH_ADMIN_PASSWORD")
+
+	generated := false
+	if username == "" || password == "" {
+		username = "admin-" + hex.EncodeToString(randomBytes(4))
+		password = base64.RawURLEncoding.EncodeToString(randomBytes(18))
+		generated = true
+	}
+
+	if generated {
+		log.Printf("secureauth: *** FIRST-RUN CREDENTIALS (shown once) ***")
+		log.Printf("secureauth: admin username: %s", username)
+		log.Printf("secureauth: admin password: %s", password)
+		log.Printf("secureauth: *** store these securely — they will not be shown again ***")
+	}
+
+	sealedPwd, err := sa.seal([]byte(password), []byte("secureauth:bootstrap-password:v1"))
+	if err != nil {
+		return fmt.Errorf("secureauth: seal bootstrap password: %w", err)
+	}
+
+	authRows, err := sa.db.Query(`SELECT id FROM ` + tblAuthorizations)
+	if err != nil {
+		return fmt.Errorf("secureauth: list authorizations for bootstrap: %w", err)
+	}
+	defer authRows.Close()
+
+	type authMK struct {
+		AuthID    string
+		Masterkey []byte
+	}
+	var mks []authMK
+	for authRows.Next() {
+		var id string
+		if err := authRows.Scan(&id); err != nil {
+			continue
+		}
+		mks = append(mks, authMK{AuthID: id, Masterkey: randomBytes(32)})
+	}
+
+	mkMap := make(map[string]string, len(mks))
+	for _, m := range mks {
+		mkMap[m.AuthID] = base64.StdEncoding.EncodeToString(m.Masterkey)
+	}
+	mkJSON, err := json.Marshal(mkMap)
+	if err != nil {
+		return fmt.Errorf("secureauth: marshal bootstrap masterkeys: %w", err)
+	}
+	sealedMK, err := sa.seal(mkJSON, []byte("secureauth:bootstrap-masterkeys:v1"))
+	if err != nil {
+		return fmt.Errorf("secureauth: seal bootstrap masterkeys: %w", err)
+	}
+
+	for i := range mks {
+		for j := range mks[i].Masterkey {
+			mks[i].Masterkey[j] = 0
+		}
+	}
+
+	_, err = sa.db.Exec(
+		`INSERT OR REPLACE INTO `+tblBootstrap+`
+		 (id, username, sealed_password, sealed_masterkeys, consumed, created_at)
+		 VALUES (1, ?, ?, ?, 0, ?)`,
+		username, sealedPwd, sealedMK, time.Now().UTC(),
+	)
+	if err != nil {
+		return fmt.Errorf("secureauth: persist bootstrap record: %w", err)
+	}
+
+	log.Printf("secureauth: first-admin bootstrap record created for user %q", username)
+	return nil
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -377,19 +548,17 @@ func randomBytes(n int) []byte {
 
 func randNonce() []byte { return randomBytes(24) }
 
-// seal encrypts plaintext under the server master key with XChaCha20-Poly1305.
-func (sa *SecureAuth) seal(plaintext []byte) ([]byte, error) {
+func (sa *SecureAuth) seal(plaintext, aad []byte) ([]byte, error) {
 	aead, err := chacha20poly1305.NewX(sa.masterKey)
 	if err != nil {
 		return nil, err
 	}
 	nonce := randNonce()
-	ct := aead.Seal(nil, nonce, plaintext, nil)
+	ct := aead.Seal(nil, nonce, plaintext, aad)
 	return append(nonce, ct...), nil
 }
 
-// open decrypts ciphertext produced by seal.
-func (sa *SecureAuth) open(ciphertext []byte) ([]byte, error) {
+func (sa *SecureAuth) open(ciphertext, aad []byte) ([]byte, error) {
 	if len(ciphertext) < 24+16 {
 		return nil, errors.New("secureauth: ciphertext too short")
 	}
@@ -398,11 +567,11 @@ func (sa *SecureAuth) open(ciphertext []byte) ([]byte, error) {
 		return nil, err
 	}
 	nonce, ct := ciphertext[:24], ciphertext[24:]
-	return aead.Open(nil, nonce, ct, nil)
+	return aead.Open(nil, nonce, ct, aad)
 }
 
 func hkdfExpand(ikm, info []byte, n int) []byte {
-	r := hkdf.New(sha256.New, ikm, nil, info)
+	r := hkdf.New(sha256.New, ikm, hkdfSalt, info)
 	out := make([]byte, n)
 	if _, err := io.ReadFull(r, out); err != nil {
 		panic("secureauth: hkdf: " + err.Error())
@@ -428,36 +597,376 @@ func concatBytes(parts ...[]byte) []byte {
 	return out
 }
 
+func validateUsername(u string) error {
+	if len(u) < 3 || len(u) > 64 {
+		return errors.New("secureauth: username must be 3-64 characters")
+	}
+	for _, c := range u {
+		switch {
+		case c >= 'a' && c <= 'z':
+		case c >= 'A' && c <= 'Z':
+		case c >= '0' && c <= '9':
+		case c == '_' || c == '.' || c == '-':
+		default:
+			return errors.New("secureauth: username contains invalid characters")
+		}
+	}
+	return nil
+}
+
+func (sa *SecureAuth) userLogTag(username string) string {
+	h := hmacSHA256(sa.masterKey, []byte("log-tag:"+username))
+	return hex.EncodeToString(h[:8])
+}
+
+func auditActor(r *http.Request, fallback string) string {
+	if sess := sessionFrom(r); sess != nil && sess.UserID != "" {
+		return sess.UserID
+	}
+	return fallback
+}
+
+func (sa *SecureAuth) hasRegisteredUsers(ctx context.Context) (bool, error) {
+	var count int
+	if err := sa.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM `+tblUsers).Scan(&count); err != nil {
+		return false, err
+	}
+	return count > 0, nil
+}
+
+// authorizationName returns the name of an authorization row, or sql.ErrNoRows.
+func (sa *SecureAuth) authorizationName(authID string) (string, error) {
+	var name string
+	err := sa.db.QueryRow(
+		`SELECT name FROM `+tblAuthorizations+` WHERE id = ?`, authID,
+	).Scan(&name)
+	return name, err
+}
+
+// revokeStaleSharedKeysTx revokes any shared key row whose (user, authorization)
+// pair is no longer backed by a role grant. It must be called after any change
+// to tblUserRoles or tblRoleAuth, inside the same transaction.
+func revokeStaleSharedKeysTx(tx *sql.Tx, now time.Time) error {
+	_, err := tx.Exec(`
+		UPDATE `+tblSharedKeys+` SET revoked_at = ?, revocation_reason = 'permissions changed'
+		WHERE revoked_at IS NULL
+		  AND NOT EXISTS (
+			SELECT 1 FROM `+tblRoleAuth+` ra
+			JOIN `+tblUserRoles+` ur ON ur.role_id = ra.role_id
+			WHERE ra.authorization_id = `+tblSharedKeys+`.authorization_id
+			  AND ur.user_id = `+tblSharedKeys+`.user_id
+		  )`, now)
+	return err
+}
+
+// ---------------------------------------------------------------------------
+// Programmatic authorization & role registration
+//
+// These functions let a host application declare its own authorizations and
+// roles before the first admin bootstraps. When a pending bootstrap record
+// exists, a fresh 32-byte masterkey is generated for each newly registered
+// authorization and sealed inside the bootstrap payload, so the first admin
+// automatically receives a wrapped copy of it during first login. This is
+// the programmatic equivalent of seeding additional authorizations at Init
+// time.
+//
+// After bootstrap has completed, RegisterAuthorization inserts the row but
+// does not create a masterkey (post-bootstrap masterkey distribution is
+// handled by the HTTP API and the browser client). To avoid name collisions
+// and to keep the data store usable from day one, register all custom
+// authorizations before the first admin logs in.
+// ---------------------------------------------------------------------------
+
+// RegisterAuthorization registers an authorization with an explicit ID.
+//
+// id must be non-empty and unique. name must be non-empty and unique. Both
+// are enforced by the database; the function returns a descriptive error if
+// either collides with an existing row.
+//
+// Idempotent: calling RegisterAuthorization with the same (id, name) pair
+// that is already present is a no-op that returns nil.
+//
+// Intended to be called after Init but before the first admin bootstraps.
+// See the package comment above for the post-bootstrap caveat.
+func (sa *SecureAuth) RegisterAuthorization(id, name, description string) error {
+	if id == "" || name == "" {
+		return errors.New("secureauth: RegisterAuthorization: id and name are required")
+	}
+
+	sa.bootstrapMu.Lock()
+	defer sa.bootstrapMu.Unlock()
+
+	tx, err := sa.db.BeginTx(context.Background(), nil)
+	if err != nil {
+		return fmt.Errorf("secureauth: RegisterAuthorization: begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	var existingName string
+	errID := tx.QueryRow(
+		`SELECT name FROM `+tblAuthorizations+` WHERE id = ?`, id,
+	).Scan(&existingName)
+	switch {
+	case errID == nil:
+		if existingName != name {
+			return fmt.Errorf(
+				"secureauth: authorization id %q already registered with name %q",
+				id, existingName,
+			)
+		}
+		// Same id, same name → idempotent. Fall through to masterkey check.
+	case errID == sql.ErrNoRows:
+		var existingID string
+		errName := tx.QueryRow(
+			`SELECT id FROM `+tblAuthorizations+` WHERE name = ?`, name,
+		).Scan(&existingID)
+		if errName == nil {
+			return fmt.Errorf(
+				"secureauth: authorization name %q already registered as id %q",
+				name, existingID,
+			)
+		}
+		if errName != sql.ErrNoRows {
+			return fmt.Errorf("secureauth: RegisterAuthorization: lookup by name: %w", errName)
+		}
+		if _, err := tx.Exec(
+			`INSERT INTO `+tblAuthorizations+` (id, name, description) VALUES (?, ?, ?)`,
+			id, name, description,
+		); err != nil {
+			return fmt.Errorf("secureauth: insert authorization: %w", err)
+		}
+	default:
+		return fmt.Errorf("secureauth: RegisterAuthorization: lookup by id: %w", errID)
+	}
+
+	if err := sa.addBootstrapMasterkeyTx(tx, id); err != nil {
+		return err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("secureauth: RegisterAuthorization: commit: %w", err)
+	}
+	return nil
+}
+
+// RegisterAuthorizationByName is a convenience wrapper that derives the ID
+// as "auth-" + name, matching the convention used by the preset
+// authorizations. Returns the derived ID on success.
+func (sa *SecureAuth) RegisterAuthorizationByName(name, description string) (string, error) {
+	if name == "" {
+		return "", errors.New("secureauth: RegisterAuthorizationByName: name is required")
+	}
+	id := "auth-" + name
+	if err := sa.RegisterAuthorization(id, name, description); err != nil {
+		return "", err
+	}
+	return id, nil
+}
+
+// RegisterRole registers a role with an explicit ID and links it to the
+// given authorization IDs. Each authorization ID must already be registered
+// (via RegisterAuthorization, RegisterAuthorizationByName, or the presets).
+//
+// Intended to be called after Init but before the first admin bootstraps,
+// although it is safe to call at any time. Unlike RegisterAuthorization,
+// registering a role never touches the bootstrap masterkeys.
+//
+// Idempotent: calling RegisterRole with the same (id, name) pair that is
+// already present is a no-op for the role row, but the authorization links
+// are still ensured (existing links are preserved, new ones are added).
+func (sa *SecureAuth) RegisterRole(id, name, description string, authorizationIDs []string) error {
+	if id == "" || name == "" {
+		return errors.New("secureauth: RegisterRole: id and name are required")
+	}
+
+	tx, err := sa.db.BeginTx(context.Background(), nil)
+	if err != nil {
+		return fmt.Errorf("secureauth: RegisterRole: begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	for _, authID := range authorizationIDs {
+		var one int
+		err := tx.QueryRow(
+			`SELECT 1 FROM `+tblAuthorizations+` WHERE id = ?`, authID,
+		).Scan(&one)
+		if err == sql.ErrNoRows {
+			return fmt.Errorf(
+				"secureauth: RegisterRole: authorization %q not registered",
+				authID,
+			)
+		}
+		if err != nil {
+			return fmt.Errorf("secureauth: RegisterRole: lookup authorization %q: %w", authID, err)
+		}
+	}
+
+	var existingName string
+	errID := tx.QueryRow(
+		`SELECT name FROM `+tblRoles+` WHERE id = ?`, id,
+	).Scan(&existingName)
+	switch {
+	case errID == nil:
+		if existingName != name {
+			return fmt.Errorf(
+				"secureauth: role id %q already registered with name %q",
+				id, existingName,
+			)
+		}
+		// Same id, same name → idempotent. Fall through to link insertion.
+	case errID == sql.ErrNoRows:
+		var existingID string
+		errName := tx.QueryRow(
+			`SELECT id FROM `+tblRoles+` WHERE name = ?`, name,
+		).Scan(&existingID)
+		if errName == nil {
+			return fmt.Errorf(
+				"secureauth: role name %q already registered as id %q",
+				name, existingID,
+			)
+		}
+		if errName != sql.ErrNoRows {
+			return fmt.Errorf("secureauth: RegisterRole: lookup by name: %w", errName)
+		}
+		if _, err := tx.Exec(
+			`INSERT INTO `+tblRoles+` (id, name, description) VALUES (?, ?, ?)`,
+			id, name, description,
+		); err != nil {
+			return fmt.Errorf("secureauth: insert role: %w", err)
+		}
+	default:
+		return fmt.Errorf("secureauth: RegisterRole: lookup by id: %w", errID)
+	}
+
+	for _, authID := range authorizationIDs {
+		if _, err := tx.Exec(
+			`INSERT OR IGNORE INTO `+tblRoleAuth+` (role_id, authorization_id) VALUES (?, ?)`,
+			id, authID,
+		); err != nil {
+			return fmt.Errorf("secureauth: link role %q to authorization %q: %w", id, authID, err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("secureauth: RegisterRole: commit: %w", err)
+	}
+	return nil
+}
+
+// RegisterRoleByName is a convenience wrapper that derives the role ID as
+// "role-" + name and resolves each authorization name to its registered ID.
+// Returns the derived role ID on success.
+func (sa *SecureAuth) RegisterRoleByName(name, description string, authorizationNames []string) (string, error) {
+	if name == "" {
+		return "", errors.New("secureauth: RegisterRoleByName: name is required")
+	}
+
+	authIDs := make([]string, 0, len(authorizationNames))
+	for _, n := range authorizationNames {
+		var authID string
+		err := sa.db.QueryRow(
+			`SELECT id FROM `+tblAuthorizations+` WHERE name = ?`, n,
+		).Scan(&authID)
+		if err == sql.ErrNoRows {
+			return "", fmt.Errorf("secureauth: RegisterRoleByName: authorization %q not registered", n)
+		}
+		if err != nil {
+			return "", fmt.Errorf("secureauth: RegisterRoleByName: lookup authorization %q: %w", n, err)
+		}
+		authIDs = append(authIDs, authID)
+	}
+
+	id := "role-" + name
+	if err := sa.RegisterRole(id, name, description, authIDs); err != nil {
+		return "", err
+	}
+	return id, nil
+}
+
+// addBootstrapMasterkeyTx ensures the pending bootstrap record (if any) holds
+// a fresh masterkey for the given authorization ID. It is a no-op when no
+// bootstrap record exists or when bootstrap has already been consumed, and
+// when the authorization already has a masterkey in the sealed blob.
+func (sa *SecureAuth) addBootstrapMasterkeyTx(tx *sql.Tx, authID string) error {
+	var consumed int
+	var sealedMK []byte
+	err := tx.QueryRow(
+		`SELECT consumed, sealed_masterkeys FROM `+tblBootstrap+` WHERE id = 1`,
+	).Scan(&consumed, &sealedMK)
+	if err == sql.ErrNoRows {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("secureauth: addBootstrapMasterkeyTx: load bootstrap record: %w", err)
+	}
+	if consumed != 0 {
+		return nil
+	}
+
+	mkMap := make(map[string]string)
+	if len(sealedMK) > 0 {
+		raw, err := sa.open(sealedMK, []byte("secureauth:bootstrap-masterkeys:v1"))
+		if err != nil {
+			return fmt.Errorf("secureauth: addBootstrapMasterkeyTx: open masterkeys: %w", err)
+		}
+		if err := json.Unmarshal(raw, &mkMap); err != nil {
+			return fmt.Errorf("secureauth: addBootstrapMasterkeyTx: unmarshal masterkeys: %w", err)
+		}
+	}
+	if _, ok := mkMap[authID]; ok {
+		return nil
+	}
+
+	mk := randomBytes(32)
+	mkMap[authID] = base64.StdEncoding.EncodeToString(mk)
+	for i := range mk {
+		mk[i] = 0
+	}
+
+	raw, err := json.Marshal(mkMap)
+	if err != nil {
+		return fmt.Errorf("secureauth: addBootstrapMasterkeyTx: marshal masterkeys: %w", err)
+	}
+	sealed, err := sa.seal(raw, []byte("secureauth:bootstrap-masterkeys:v1"))
+	if err != nil {
+		return fmt.Errorf("secureauth: addBootstrapMasterkeyTx: seal masterkeys: %w", err)
+	}
+	if _, err := tx.Exec(
+		`UPDATE `+tblBootstrap+` SET sealed_masterkeys = ? WHERE id = 1`,
+		sealed,
+	); err != nil {
+		return fmt.Errorf("secureauth: addBootstrapMasterkeyTx: persist masterkeys: %w", err)
+	}
+	return nil
+}
+
 // ---------------------------------------------------------------------------
 // HTTP plumbing
 // ---------------------------------------------------------------------------
 
-// SecureAuthAndCommHandler registers all routes on mux and returns the handler.
-//
-// Usage:
-//
-//	sa, _ := secureauth.Init("postgres", "…", opts)
-//	mux := http.NewServeMux()
-//	secureauth.SecureAuthAndCommHandler(sa, mux)
-//	http.ListenAndServeTLS(":8443", cert, key, mux)
 func SecureAuthAndCommHandler(sa *SecureAuth, mux *http.ServeMux) http.Handler {
-	// Pre-auth / unauthenticated endpoints.
-	mux.HandleFunc("/api/opaque-server-setup", sa.wrap(sa.handleOpaqueServerSetup, false))
+	mux.HandleFunc("/api/server-id", sa.wrap(sa.handleServerID, false))
 	mux.HandleFunc("/api/tls-server-end-point", sa.wrap(sa.handleTlsServerEndPoint, false))
-	mux.HandleFunc("/api/registration-record", sa.wrap(sa.handleRegistrationRecord, false))
+	mux.HandleFunc("/api/register/init", sa.wrap(sa.handleRegisterInit, false))
+	mux.HandleFunc("/api/login/init", sa.wrap(sa.handleLoginInit, false))
 	mux.HandleFunc("/api/login2", sa.wrap(sa.handleLogin2, false))
+
+	// /logout must be CSRF-exempt: a stale session cookie can otherwise
+	// block the browser from ever clearing it (no CSRF token is available
+	// until after a successful login).
 	mux.HandleFunc("/logout", sa.wrap(sa.handleLogout, false))
 
-	// Authenticated endpoints.
 	mux.HandleFunc("/api/privatekey", sa.wrap(sa.loadSession(sa.handleGetPrivateKey), true))
 
-	// Bootstrap: createUser is unauthenticated while there are zero users.
 	mux.HandleFunc("/api/createuser", sa.wrap(sa.requirePermissionOrBootstrap("user.create", sa.handleCreateUser), true))
 	mux.HandleFunc("/api/deleteuser", sa.wrap(sa.requirePermission("user.delete", sa.handleDeleteUser), true))
 	mux.HandleFunc("/api/getusers", sa.wrap(sa.requirePermission("user.read", sa.handleGetUsers), false))
 	mux.HandleFunc("/api/updateuser", sa.wrap(sa.requirePermission("user.update", sa.handleUpdateUser), true))
+
 	mux.HandleFunc("/api/sharekeys", sa.wrap(sa.requirePermission("sharekeys.write", sa.handleShareKeys), true))
 	mux.HandleFunc("/api/shared-keys/check", sa.wrap(sa.loadSession(sa.handleSharedKeysCheck), false))
+	mux.HandleFunc("/api/get-wrapped-masterkey", sa.wrap(sa.loadSession(sa.handleGetWrappedMasterkey), false))
 
 	mux.HandleFunc("/api/getroles", sa.wrap(sa.requirePermission("role.read", sa.handleGetRoles), false))
 	mux.HandleFunc("/api/addrole", sa.wrap(sa.requirePermission("role.create", sa.handleAddRole), true))
@@ -468,33 +977,42 @@ func SecureAuthAndCommHandler(sa *SecureAuth, mux *http.ServeMux) http.Handler {
 	mux.HandleFunc("/api/addauthorization", sa.wrap(sa.requirePermission("authorization.create", sa.handleAddAuthorization), true))
 	mux.HandleFunc("/api/updateauthorization", sa.wrap(sa.requirePermission("authorization.update", sa.handleUpdateAuthorization), true))
 	mux.HandleFunc("/api/deleteauthorization", sa.wrap(sa.requirePermission("authorization.delete", sa.handleDeleteAuthorization), true))
-	mux.HandleFunc("/api/authorization-public-key", sa.wrap(sa.loadSession(sa.handleAuthorizationPublicKey), false))
 
-	// Threshold orchestration.
-	mux.HandleFunc("/api/threshold/encrypt", sa.wrap(sa.loadSession(sa.handleThresholdEncrypt), true))
-	mux.HandleFunc("/api/threshold/share", sa.wrap(sa.loadSession(sa.handleThresholdShare), false))
-	mux.HandleFunc("/api/threshold/partial", sa.wrap(sa.loadSession(sa.handleThresholdPartial), true))
-	mux.HandleFunc("/api/threshold/partials", sa.wrap(sa.loadSession(sa.handleThresholdPartials), false))
+	mux.HandleFunc("/api/data/put", sa.wrap(sa.loadSession(sa.handleDataPut), true))
+	mux.HandleFunc("/api/data/get", sa.wrap(sa.loadSession(sa.handleDataGet), false))
+	mux.HandleFunc("/api/data/delete", sa.wrap(sa.loadSession(sa.handleDataDelete), true))
+	mux.HandleFunc("/api/data/list", sa.wrap(sa.loadSession(sa.handleDataList), false))
 
-	// Static / pages.
-	mux.HandleFunc("/static/secureauth.mjs", sa.wrap(sa.handleServeJS, false))
+	mux.HandleFunc("/api/bootstrap/credentials", sa.wrap(sa.handleBootstrapCredentials, false))
+	mux.HandleFunc("/api/bootstrap/masterkeys-pending", sa.wrap(sa.handleBootstrapMasterkeysPending, false))
+	mux.HandleFunc("/api/bootstrap/first-user", sa.wrap(sa.handleBootstrapFirstUser, true))
+
+	mux.HandleFunc("/static/secureauth.mjs", sa.wrap(sa.handleServeSecureAuthJS, false))
+	mux.HandleFunc("/static/opaque.mjs", sa.wrap(sa.handleServeOpaqueJS, false))
 	mux.HandleFunc("/", sa.wrap(sa.handleIndex, false))
 	return mux
 }
 
-// wrap applies TLS enforcement, security headers, CSRF (when a session is
-// present), and rate limiting.
 func (sa *SecureAuth) wrap(next http.HandlerFunc, needsCSRF bool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Body != nil {
+			r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
+		}
 		if err := requireTLS(r); err != nil {
 			http.Error(w, "HTTPS required", http.StatusForbidden)
 			return
 		}
-		setSecurityHeaders(w, r)
+		r = setSecurityHeaders(w, r)
+
 		if needsCSRF && sessionIDFromRequest(r) != "" {
-			if err := sa.verifyCSRF(r); err != nil {
-				http.Error(w, "CSRF check failed", http.StatusForbidden)
-				return
+			// Only enforce CSRF if the session actually exists server-side.
+			// A stale cookie (session expired/deleted) must not be able to
+			// 403 requests that would otherwise be valid.
+			if _, err := sa.loadSessionInfo(r); err == nil {
+				if err := sa.verifyCSRF(r); err != nil {
+					http.Error(w, "CSRF check failed", http.StatusForbidden)
+					return
+				}
 			}
 		}
 		next(w, r)
@@ -510,20 +1028,25 @@ func requireTLS(r *http.Request) error {
 
 type cspNonceKey struct{}
 
-func setSecurityHeaders(w http.ResponseWriter, r *http.Request) {
+func setSecurityHeaders(w http.ResponseWriter, r *http.Request) *http.Request {
+	nonce := hex.EncodeToString(randomBytes(16))
+	r = r.WithContext(context.WithValue(r.Context(), cspNonceKey{}, nonce))
+
 	h := w.Header()
 	h.Set("Strict-Transport-Security", "max-age=63072000; includeSubDomains; preload")
 	h.Set("X-Frame-Options", "DENY")
 	h.Set("X-Content-Type-Options", "nosniff")
 	h.Set("Referrer-Policy", "no-referrer")
-	nonce := randomBytes(16)
-	*r = *r.WithContext(context.WithValue(r.Context(), cspNonceKey{}, hex.EncodeToString(nonce)))
 	h.Set("Content-Security-Policy", fmt.Sprintf(
-		"default-src 'none'; script-src 'nonce-%s' 'self'; style-src 'self'; "+
-			"connect-src 'self'; img-src 'self'; frame-ancestors 'none'; "+
-			"base-uri 'none'; form-action 'self'",
-		hex.EncodeToString(nonce),
+		"default-src 'none'; "+
+			"script-src 'nonce-%s' 'wasm-unsafe-eval' https://cdn.jsdelivr.net; "+
+			"style-src 'self' 'unsafe-inline'; "+
+			"connect-src 'self' https://cdn.jsdelivr.net; "+
+			"img-src 'self'; "+
+			"frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
+		nonce,
 	))
+	return r
 }
 
 func cspNonce(r *http.Request) string {
@@ -589,8 +1112,19 @@ func (rl *rateLimiter) allow(key string, burst float64, refillPerSec float64) bo
 // Audit log
 // ---------------------------------------------------------------------------
 
-// appendAudit writes a hash-chained audit entry. The read-then-write is
-// guarded by auditMu so concurrent writers cannot fork the chain.
+func (sa *SecureAuth) auditHash(prevHash []byte, ts, userID, action, resource, result, ip, details string) []byte {
+	mac := hmac.New(sha256.New, sa.masterKey)
+	mac.Write(prevHash)
+	mac.Write([]byte(ts))
+	mac.Write([]byte(userID))
+	mac.Write([]byte(action))
+	mac.Write([]byte(resource))
+	mac.Write([]byte(result))
+	mac.Write([]byte(ip))
+	mac.Write([]byte(details))
+	return mac.Sum(nil)
+}
+
 func (sa *SecureAuth) appendAudit(userID, action, resource, result, ip, details string) {
 	sa.auditMu.Lock()
 	defer sa.auditMu.Unlock()
@@ -602,16 +1136,7 @@ func (sa *SecureAuth) appendAudit(userID, action, resource, result, ip, details 
 	_ = row.Scan(&prevHash)
 
 	ts := time.Now().UTC().Format(time.RFC3339Nano)
-	h := sha256.New()
-	h.Write(prevHash)
-	h.Write([]byte(ts))
-	h.Write([]byte(userID))
-	h.Write([]byte(action))
-	h.Write([]byte(resource))
-	h.Write([]byte(result))
-	h.Write([]byte(ip))
-	h.Write([]byte(details))
-	entryHash := h.Sum(nil)
+	entryHash := sa.auditHash(prevHash, ts, userID, action, resource, result, ip, details)
 
 	_, _ = sa.db.Exec(
 		`INSERT INTO `+tblAudit+`
@@ -622,25 +1147,48 @@ func (sa *SecureAuth) appendAudit(userID, action, resource, result, ip, details 
 	)
 }
 
+func (sa *SecureAuth) VerifyAuditChain() error {
+	rows, err := sa.db.Query(
+		`SELECT prev_hash, entry_hash, timestamp, user_id, action, resource,
+		        result, ip_address, details
+		 FROM ` + tblAudit + ` ORDER BY id`,
+	)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	var prev []byte
+	for rows.Next() {
+		var (
+			prevHash, entryHash                               []byte
+			ts, userID, action, resource, result, ip, details string
+		)
+		if err := rows.Scan(&prevHash, &entryHash, &ts, &userID, &action,
+			&resource, &result, &ip, &details); err != nil {
+			return err
+		}
+		if !hmac.Equal(prevHash, prev) {
+			return errors.New("secureauth: audit chain broken (prev_hash mismatch)")
+		}
+		expected := sa.auditHash(prevHash, ts, userID, action, resource, result, ip, details)
+		if !hmac.Equal(expected, entryHash) {
+			return errors.New("secureauth: audit chain broken (entry_hash mismatch)")
+		}
+		prev = entryHash
+	}
+	return rows.Err()
+}
+
 // ---------------------------------------------------------------------------
-// CSRF (true double-submit; §6)
+// CSRF
 // ---------------------------------------------------------------------------
-//
-// The server generates a random token and a session-bound HMAC cookie.
-// The token is returned to the client (in the /api/login2 JSON response) and
-// the client echoes it back in X-CSRF-Token on every state-changing request.
-// The cookie is sent by the browser automatically. Verification recomputes
-// HMAC(masterKey, sessionID || token) and compares against the cookie in
-// constant time. The token is NOT stored server-side.
 
 func (sa *SecureAuth) newCSRF(sessionID string) (token, cookieValue string) {
 	raw := randomBytes(32)
 	token = base64.StdEncoding.EncodeToString(raw)
-	mac := hmac.New(sha256.New, sa.masterKey)
-	mac.Write([]byte(sessionID))
-	mac.Write(raw)
-	cookieValue = base64.StdEncoding.EncodeToString(mac.Sum(nil))
-	return token, cookieValue
+	// Same value goes in the cookie and the DB. Classic double-submit.
+	return token, token
 }
 
 func (sa *SecureAuth) verifyCSRF(r *http.Request) error {
@@ -648,28 +1196,18 @@ func (sa *SecureAuth) verifyCSRF(r *http.Request) error {
 	if sessionID == "" {
 		return errors.New("no session")
 	}
-
-	cookie, err := r.Cookie("secureauth_csrf")
-	if err != nil {
-		return errors.New("no CSRF cookie")
-	}
-
 	header := r.Header.Get("X-CSRF-Token")
 	if header == "" {
 		return errors.New("no CSRF header")
 	}
-
-	raw, err := base64.StdEncoding.DecodeString(header)
+	var stored string
+	err := sa.db.QueryRow(
+		`SELECT csrf_token FROM `+tblSessions+` WHERE session_id = ?`, sessionID,
+	).Scan(&stored)
 	if err != nil {
-		return errors.New("bad CSRF header encoding")
+		return errors.New("no session row")
 	}
-
-	mac := hmac.New(sha256.New, sa.masterKey)
-	mac.Write([]byte(sessionID))
-	mac.Write(raw)
-	expected := base64.StdEncoding.EncodeToString(mac.Sum(nil))
-
-	if subtle.ConstantTimeCompare([]byte(expected), []byte(cookie.Value)) != 1 {
+	if subtle.ConstantTimeCompare([]byte(stored), []byte(header)) != 1 {
 		return errors.New("CSRF mismatch")
 	}
 	return nil
@@ -689,7 +1227,7 @@ func sessionIDFromRequest(r *http.Request) string {
 type sessionInfo struct {
 	SessionID string
 	UserID    string
-	Key       []byte // raw bytes for XChaCha20-Poly1305
+	Key       []byte
 	CSRF      string
 	ExpiresAt time.Time
 }
@@ -716,7 +1254,7 @@ func (sa *SecureAuth) loadSessionInfo(r *http.Request) (*sessionInfo, error) {
 		_, _ = sa.db.Exec(`DELETE FROM `+tblSessions+` WHERE session_id = ?`, sid)
 		return nil, errors.New("session expired")
 	}
-	key, err := sa.open(keyCipher)
+	key, err := sa.open(keyCipher, aadSessionKey)
 	if err != nil {
 		return nil, err
 	}
@@ -725,8 +1263,6 @@ func (sa *SecureAuth) loadSessionInfo(r *http.Request) (*sessionInfo, error) {
 	}, nil
 }
 
-// loadSession is a convenience wrapper returning a http.HandlerFunc that
-// injects the sessionInfo into the request context.
 func (sa *SecureAuth) loadSession(next func(http.ResponseWriter, *http.Request, *sessionInfo)) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		sess, err := sa.loadSessionInfo(r)
@@ -749,44 +1285,59 @@ func sessionFrom(r *http.Request) *sessionInfo {
 // Middleware
 // ---------------------------------------------------------------------------
 
-// requirePermission returns a handler that validates the session, loads the
-// user's authorizations, and checks the required permission.
 func (sa *SecureAuth) requirePermission(permission string, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		sess, err := sa.loadSessionInfo(r)
 		if err != nil {
-			sa.appendAudit("", "authorize", permission, "deny", clientIP(r), err.Error())
+			sa.appendAudit("", "authorize", permission, "deny", sa.clientIP(r), err.Error())
 			http.Error(w, "Forbidden", http.StatusForbidden)
 			return
 		}
 		ok, err := sa.userHasPermission(sess.UserID, permission)
 		if err != nil || !ok {
-			sa.appendAudit(sess.UserID, "authorize", permission, "deny", clientIP(r), "")
+			sa.appendAudit(sess.UserID, "authorize", permission, "deny", sa.clientIP(r), "")
 			http.Error(w, "Forbidden", http.StatusForbidden)
 			return
 		}
-		sa.appendAudit(sess.UserID, "authorize", permission, "allow", clientIP(r), "")
+		sa.appendAudit(sess.UserID, "authorize", permission, "allow", sa.clientIP(r), "")
 		r = r.WithContext(context.WithValue(r.Context(), sessionCtxKey{}, sess))
 		next(w, r)
 	}
 }
 
-// requirePermissionOrBootstrap allows the request unauthenticated if there are
-// zero users in the database (the SuperAdmin bootstrap case).
 func (sa *SecureAuth) requirePermissionOrBootstrap(permission string, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		var count int
-		_ = sa.db.QueryRow(`SELECT COUNT(*) FROM ` + tblUsers).Scan(&count)
-		if count == 0 {
+		hasUsers, err := sa.hasRegisteredUsers(r.Context())
+		if err != nil {
+			http.Error(w, "Internal server error", http.StatusInternalServerError)
+			return
+		}
+
+		if !hasUsers {
+			got := r.Header.Get("X-Bootstrap-Token")
+			if subtle.ConstantTimeCompare([]byte(got), sa.bootstrapToken) != 1 {
+				http.Error(w, "Forbidden", http.StatusForbidden)
+				return
+			}
 			next(w, r)
 			return
 		}
-		sa.requirePermission(permission, next)(w, r)
+
+		sess, err := sa.loadSessionInfo(r)
+		if err != nil {
+			http.Error(w, "Forbidden: Invalid permissions or bootstrap already complete", http.StatusForbidden)
+			return
+		}
+		ok, err := sa.userHasPermission(sess.UserID, permission)
+		if err != nil || !ok {
+			http.Error(w, "Forbidden: Invalid permissions or bootstrap already complete", http.StatusForbidden)
+			return
+		}
+		r = r.WithContext(context.WithValue(r.Context(), sessionCtxKey{}, sess))
+		next(w, r)
 	}
 }
 
-// RequireRole is a convenience wrapper: validates session, loads roles, checks
-// membership. Roles are only aggregates of authorizations (§6).
 func (sa *SecureAuth) RequireRole(role string, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		sess, err := sa.loadSessionInfo(r)
@@ -801,6 +1352,14 @@ func (sa *SecureAuth) RequireRole(role string, next http.HandlerFunc) http.Handl
 		}
 		next(w, r)
 	}
+}
+
+func (sa *SecureAuth) UserHasAuthorization(r *http.Request, authorizationName string) (bool, error) {
+	sess, err := sa.loadSessionInfo(r)
+	if err != nil {
+		return false, err
+	}
+	return sa.userHasPermission(sess.UserID, authorizationName)
 }
 
 func (sa *SecureAuth) userHasPermission(userID, permission string) (bool, error) {
@@ -839,26 +1398,46 @@ func (sa *SecureAuth) userHasRole(userID, role string) (bool, error) {
 	return err == nil, err
 }
 
-func clientIP(r *http.Request) string {
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		parts := strings.Split(xff, ",")
-		return strings.TrimSpace(parts[0])
+func (sa *SecureAuth) clientIP(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = r.RemoteAddr
+	}
+	peer := net.ParseIP(host)
+
+	trusted := false
+	if peer != nil {
+		if len(sa.trustedProxies) > 0 {
+			for _, n := range sa.trustedProxies {
+				if n.Contains(peer) {
+					trusted = true
+					break
+				}
+			}
+		} else if peer.IsLoopback() || peer.IsPrivate() {
+			trusted = true
+		}
+	}
+	if trusted {
+		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+			parts := strings.Split(xff, ",")
+			return strings.TrimSpace(parts[0])
+		}
 	}
 	return r.RemoteAddr
 }
 
 // ---------------------------------------------------------------------------
-// OPAQUE server setup / channel binding
+// OPAQUE endpoints
 // ---------------------------------------------------------------------------
 
-func (sa *SecureAuth) handleOpaqueServerSetup(w http.ResponseWriter, r *http.Request) {
+func (sa *SecureAuth) handleServerID(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{
-		"serverSetup": base64.StdEncoding.EncodeToString(sa.opaqueSetup),
-		"serverId":    string(sa.serverID),
+		"serverId": string(sa.serverID),
 	})
 }
 
@@ -867,99 +1446,105 @@ func (sa *SecureAuth) handleTlsServerEndPoint(w http.ResponseWriter, r *http.Req
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	if sa.tlsEndPoint == nil {
-		http.Error(w, "channel binding not configured", http.StatusNotFound)
-		return
-	}
 	w.Header().Set("Content-Type", "application/octet-stream")
 	_, _ = w.Write(sa.tlsEndPoint)
 }
 
-// ---------------------------------------------------------------------------
-// Registration record (real or fake)
-// ---------------------------------------------------------------------------
-
-// handleRegistrationRecord always returns a syntactically valid record. For
-// existing users, the stored opaque-ke registration record is returned. For
-// unknown users, a deterministic fake is derived from the master key, along
-// with a fake userIdentifier, so the client's OPAQUE finish fails identically
-// to a wrong password. (§5)
-func (sa *SecureAuth) handleRegistrationRecord(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	username := r.URL.Query().Get("username")
-	if username == "" {
-		http.Error(w, "missing username", http.StatusBadRequest)
-		return
-	}
-
-	var rec []byte
-	err := sa.db.QueryRow(
-		`SELECT opaque_registration_record FROM `+tblUsers+` WHERE username = ?`,
-		username,
-	).Scan(&rec)
-
-	var uid []byte
-	if err == sql.ErrNoRows {
-		rec, uid = sa.fakeRecordAndIdentifier(username)
-	} else if err != nil {
-		http.Error(w, "internal error", http.StatusInternalServerError)
-		return
-	} else {
-		uid = []byte(username)
-	}
-
-	writeJSON(w, http.StatusOK, map[string]string{
-		"registrationRecord": base64.StdEncoding.EncodeToString(rec),
-		"userIdentifier":     base64.StdEncoding.EncodeToString(uid),
-	})
-}
-
-// fakeRecordAndIdentifier derives a deterministic fake registration record and
-// userIdentifier for a non-existent user. The record is not a real opaque-ke
-// record but is opaque bytes of the expected size; the client's OPAQUE finish
-// step will fail on the resulting session key regardless.
-func (sa *SecureAuth) fakeRecordAndIdentifier(username string) ([]byte, []byte) {
-	recordSeed := hmacSHA256(sa.masterKey, []byte("fake-record:"+username))
-	record := hkdfExpand(recordSeed, []byte("SecureAuth fake record"), 192)
-
-	uidSeed := hmacSHA256(sa.masterKey, []byte("fake-uid:"+username))
-	uid := hkdfExpand(uidSeed, []byte("SecureAuth fake uid"), 32)
-
-	return record, uid
-}
-
-// ---------------------------------------------------------------------------
-// Session establishment (login2)
-// ---------------------------------------------------------------------------
-
-type login2Request struct {
-	Username        string `json:"username"`
-	ClientEphemeral string `json:"clientEphemeral"`
-	ClientMAC       string `json:"clientMAC"`
-}
-
-type login2Response struct {
-	SessionID                string `json:"sessionId"`
-	ServerEphemeralPublicKey string `json:"serverEphemeralPublicKey"`
-	CSRFToken                string `json:"csrfToken"`
-	TLSEndPoint              string `json:"tlsEndPoint,omitempty"`
-}
-
-func (sa *SecureAuth) handleLogin2(w http.ResponseWriter, r *http.Request) {
+func (sa *SecureAuth) handleRegisterInit(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	ip := clientIP(r)
-	if !sa.rl.allow("login2:"+ip, 10, 1.0/60.0) {
+	ip := sa.clientIP(r)
+	if !sa.rl.allow("register-init:"+ip, 10, 1.0/60.0) {
 		http.Error(w, "rate limited", http.StatusTooManyRequests)
 		return
 	}
 
-	var req login2Request
+	var req struct {
+		Username            string `json:"username"`
+		RegistrationRequest string `json:"registrationRequest"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	if req.Username == "" {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	if err := validateUsername(req.Username); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+
+	rrBytes, err := base64.StdEncoding.DecodeString(req.RegistrationRequest)
+	if err != nil {
+		log.Printf("secureauth: register/init: base64 decode failed: %v", err)
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+
+	des, err := sa.opaqueConf.Deserializer()
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	rr, err := des.RegistrationRequest(rrBytes)
+	if err != nil {
+		log.Printf("secureauth: register/init: deserialize RegistrationRequest failed: %v", err)
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+
+	var credID []byte
+	err = sa.db.QueryRow(
+		`SELECT opaque_credential_id FROM `+tblUsers+` WHERE username = ?`,
+		req.Username,
+	).Scan(&credID)
+	if err == sql.ErrNoRows {
+		credID = opaque.RandomBytes(32)
+	} else if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
+	resp, err := sa.opaqueServer.RegistrationResponse(rr, credID, nil)
+	if err != nil {
+		log.Printf("secureauth: register/init: RegistrationResponse failed: %v", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
+	pendingID := hex.EncodeToString(randomBytes(32))
+	_, err = sa.db.Exec(
+		`INSERT INTO `+tblPendingRegs+`
+		 (id, username, credential_id, created_at, expires_at)
+		 VALUES (?, ?, ?, ?, ?)`,
+		pendingID, req.Username, credID,
+		time.Now().UTC(), time.Now().Add(10*time.Minute),
+	)
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]string{
+		"registrationResponse": base64.StdEncoding.EncodeToString(resp.Serialize()),
+		"pendingRegId":         pendingID,
+	})
+}
+
+func (sa *SecureAuth) handleLoginInit(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		Username string `json:"username"`
+		KE1      string `json:"ke1"`
+	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
@@ -969,109 +1554,293 @@ func (sa *SecureAuth) handleLogin2(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	clientEph, err := base64.StdEncoding.DecodeString(req.ClientEphemeral)
-	if err != nil || len(clientEph) != 32 {
-		http.Error(w, "bad request", http.StatusBadRequest)
+	ip := sa.clientIP(r)
+	if !sa.rl.allow("login-init-ip:"+ip, 10, 1.0/60.0) ||
+		!sa.rl.allow("login-init-user:"+req.Username, 5, 1.0/60.0) {
+		http.Error(w, "rate limited", http.StatusTooManyRequests)
 		return
 	}
-	clientMAC, err := base64.StdEncoding.DecodeString(req.ClientMAC)
+
+	ke1Bytes, err := base64.StdEncoding.DecodeString(req.KE1)
 	if err != nil {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
-	_ = clientMAC // Retained for audit logging only; the server cannot verify
-	//                without the OPAQUE session secret. The OPAQUE password
-	//                check is performed client-side (see secureauth.mjs).
+	des, err := sa.opaqueConf.Deserializer()
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	ke1, err := des.KE1(ke1Bytes)
+	if err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
 
-	// Server ephemeral X25519 key pair.
+	record, credID, err := sa.loadClientRecord(req.Username)
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
+	// Fetch the stored per-user KSF salt. For a non-existent user, return a
+	// random salt so the response is indistinguishable from an existing user
+	// whose salt is also random. For legacy rows with NULL ksf_salt, fall
+	// back to 32 zero bytes (matches the pre-migration fixed-salt behaviour).
+	var ksfSalt []byte
+	err = sa.db.QueryRow(
+		`SELECT ksf_salt FROM `+tblUsers+` WHERE username = ?`, req.Username,
+	).Scan(&ksfSalt)
+	if err == sql.ErrNoRows {
+		ksfSalt = randomBytes(32)
+	} else if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	if len(ksfSalt) == 0 {
+		ksfSalt = make([]byte, 32)
+	}
+
+	ke2, output, err := sa.opaqueServer.GenerateKE2(ke1, record)
+	if err != nil {
+		http.Error(w, "authentication failed", http.StatusUnauthorized)
+		return
+	}
+	attemptID := hex.EncodeToString(randomBytes(32))
+	transcriptHash := sha256.Sum256(concatBytes(ke1Bytes, ke2.Serialize()))
+	expires := time.Now().Add(sa.loginAttemptTTL)
+
+	_, err = sa.db.Exec(
+		`INSERT INTO `+tblLoginAttempts+`
+		 (id, username, credential_id, client_mac, session_secret,
+		  transcript_hash, created_at, expires_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		attemptID, req.Username, credID,
+		output.ClientMAC, output.SessionSecret,
+		transcriptHash[:], time.Now().UTC(), expires,
+	)
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]string{
+		"loginAttemptId": attemptID,
+		"ke2":            base64.StdEncoding.EncodeToString(ke2.Serialize()),
+		"ksfSalt":        base64.StdEncoding.EncodeToString(ksfSalt),
+	})
+}
+
+func (sa *SecureAuth) loadClientRecord(username string) (*opaque.ClientRecord, []byte, error) {
+	var (
+		recBytes []byte
+		credID   []byte
+	)
+	err := sa.db.QueryRow(
+		`SELECT opaque_registration_record, opaque_credential_id
+         FROM `+tblUsers+` WHERE username = ?`, username,
+	).Scan(&recBytes, &credID)
+
+	if err == sql.ErrNoRows {
+		fakeCredID := sa.fakeCredentialID(username)
+		fakeRecord, err := sa.opaqueConf.GetFakeRecord(fakeCredID)
+		if err != nil {
+			return nil, nil, err
+		}
+		return fakeRecord, fakeCredID, nil
+	}
+	if err != nil {
+		return nil, nil, err
+	}
+
+	des, err := sa.opaqueConf.Deserializer()
+	if err != nil {
+		return nil, nil, err
+	}
+	regRecord, err := des.RegistrationRecord(recBytes)
+	if err != nil {
+		return nil, nil, err
+	}
+	return &opaque.ClientRecord{
+		CredentialIdentifier: credID,
+		ClientIdentity:       []byte(username),
+		RegistrationRecord:   regRecord,
+	}, credID, nil
+}
+
+func (sa *SecureAuth) fakeCredentialID(username string) []byte {
+	return hmacSHA256(sa.masterKey, []byte("fake-cred-id:"+username))
+}
+
+func (sa *SecureAuth) handleLogin2(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	ip := sa.clientIP(r)
+	if !sa.rl.allow("login2:"+ip, 10, 1.0/60.0) {
+		http.Error(w, "rate limited", http.StatusTooManyRequests)
+		return
+	}
+
+	var req struct {
+		LoginAttemptID  string `json:"loginAttemptId"`
+		KE3             string `json:"ke3"`
+		ClientEphemeral string `json:"clientEphemeral"`
+		ClientMAC       string `json:"clientMAC"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+
+	var (
+		username       string
+		credID         []byte
+		storedMAC      []byte
+		storedSecret   []byte
+		transcriptHash []byte
+		expires        time.Time
+	)
+	err := sa.db.QueryRow(
+		`SELECT username, credential_id, client_mac, session_secret,
+		        transcript_hash, expires_at
+		 FROM `+tblLoginAttempts+` WHERE id = ?`, req.LoginAttemptID,
+	).Scan(&username, &credID, &storedMAC, &storedSecret, &transcriptHash, &expires)
+	if err != nil {
+		sa.genericAuthFailure(w)
+		return
+	}
+	if time.Now().After(expires) {
+		_, _ = sa.db.Exec(`DELETE FROM `+tblLoginAttempts+` WHERE id = ?`, req.LoginAttemptID)
+		sa.genericAuthFailure(w)
+		return
+	}
+	_, _ = sa.db.Exec(`DELETE FROM `+tblLoginAttempts+` WHERE id = ?`, req.LoginAttemptID)
+
+	if !sa.rl.allow("login2-user:"+username, 5, 1.0/60.0) {
+		http.Error(w, "rate limited", http.StatusTooManyRequests)
+		return
+	}
+
+	ke3Bytes, err := base64.StdEncoding.DecodeString(req.KE3)
+	if err != nil {
+		sa.genericAuthFailure(w)
+		return
+	}
+	des, err := sa.opaqueConf.Deserializer()
+	if err != nil {
+		sa.genericAuthFailure(w)
+		return
+	}
+	ke3, err := des.KE3(ke3Bytes)
+	if err != nil {
+		sa.genericAuthFailure(w)
+		return
+	}
+
+	if err := sa.opaqueServer.LoginFinish(ke3, storedMAC); err != nil {
+		sa.recordFailedAttempt(username, ip)
+		sa.genericAuthFailure(w)
+		return
+	}
+
+	clientEph, err := base64.StdEncoding.DecodeString(req.ClientEphemeral)
+	if err != nil || len(clientEph) != 32 {
+		sa.genericAuthFailure(w)
+		return
+	}
+	clientMAC, err := base64.StdEncoding.DecodeString(req.ClientMAC)
+	if err != nil {
+		sa.genericAuthFailure(w)
+		return
+	}
+
+	macKey := hkdfExpand(storedSecret, []byte("SecureAuth client MAC"), 32)
+	expectedMAC := hmacSHA256(macKey, clientEph)
+	if subtle.ConstantTimeCompare(expectedMAC, clientMAC) != 1 {
+		sa.recordFailedAttempt(username, ip)
+		sa.genericAuthFailure(w)
+		return
+	}
+
 	serverEphPriv := randomBytes(32)
 	serverEphPub, err := curve25519.X25519(serverEphPriv, curve25519.Basepoint)
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
-
-	// X25519 shared secret.
 	shared, err := curve25519.X25519(serverEphPriv, clientEph)
 	if err != nil {
-		sa.appendAudit(req.Username, "login2", "", "deny", ip, "x25519")
-		http.Error(w, "authentication failed", http.StatusUnauthorized)
+		sa.genericAuthFailure(w)
 		return
 	}
 
-	// Channel binding: tls-server-end-point.
-	tlsEndPoint := sa.tlsEndPoint
-	if tlsEndPoint == nil {
-		tlsEndPoint = []byte{}
+	if sa.tlsEndPoint == nil {
+		http.Error(w, "channel binding not configured", http.StatusInternalServerError)
+		return
 	}
 
-	// Session key = HKDF(shared || tlsEndPoint, "SecureAuth session key").
+	serverNonce := randomBytes(16)
+	clientNonce := randomBytes(16)
+	sessionIDraw := hmacSHA256(storedSecret,
+		concatBytes(transcriptHash, serverNonce, clientNonce))
+	sessionID := hex.EncodeToString(sessionIDraw)
+
 	sessionKey := hkdfExpand(
-		concatBytes(shared, tlsEndPoint),
+		concatBytes(shared, storedSecret, transcriptHash, sa.tlsEndPoint),
 		[]byte("SecureAuth session key"),
 		32,
 	)
 
-	// Session ID — random, never chosen by the client (§5).
-	sessionID := hex.EncodeToString(randomBytes(32))
-
-	// Seal the session key under the master key.
-	sessionKeyEnc, err := sa.seal(sessionKey)
+	sessionKeyEnc, err := sa.seal(sessionKey, aadSessionKey)
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
 
-	// CSRF: token + session-bound HMAC cookie.
 	csrfToken, csrfCookie := sa.newCSRF(sessionID)
+	expiresAt := time.Now().Add(sa.sessionTTL)
 
-	// Determine the user ID. For an unknown user the client's OPAQUE finish
-	// will have already failed before reaching this endpoint; we still record
-	// the username for audit purposes.
-	userID := req.Username
-
-	expires := time.Now().Add(sa.sessionTTL)
 	_, err = sa.db.Exec(
 		`INSERT INTO `+tblSessions+`
 		 (session_id, user_id, session_key_ciphertext, csrf_token,
-		  created_at, expires_at,
+		  created_at, expires_at, paake_transcript_hash,
 		  client_ephemeral_public_key, server_ephemeral_public_key)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		sessionID, userID, sessionKeyEnc, csrfToken,
-		time.Now().UTC(), expires, clientEph, serverEphPub,
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		sessionID, username, sessionKeyEnc, csrfToken,
+		time.Now().UTC(), expiresAt, transcriptHash, clientEph, serverEphPub,
 	)
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
 
-	// Set cookies.
 	http.SetCookie(w, &http.Cookie{
-		Name:     "secureauth_session",
-		Value:    sessionID,
-		Path:     "/",
-		Secure:   true,
-		HttpOnly: true,
-		SameSite: http.SameSiteStrictMode,
-		Expires:  expires,
+		Name: "secureauth_session", Value: sessionID, Path: "/",
+		Secure: true, HttpOnly: true, SameSite: http.SameSiteStrictMode,
+		Expires: expiresAt,
 	})
 	http.SetCookie(w, &http.Cookie{
-		Name:     "secureauth_csrf",
-		Value:    csrfCookie,
-		Path:     "/",
-		Secure:   true,
-		HttpOnly: false, // JS must read this cookie.
-		SameSite: http.SameSiteStrictMode,
-		Expires:  expires,
+		Name: "secureauth_csrf", Value: csrfCookie, Path: "/",
+		Secure: true, HttpOnly: false, SameSite: http.SameSiteStrictMode,
+		Expires: expiresAt,
 	})
 
-	sa.appendAudit(userID, "login2", "", "allow", ip, "")
-	writeJSON(w, http.StatusOK, login2Response{
-		SessionID:                sessionID,
-		ServerEphemeralPublicKey: base64.StdEncoding.EncodeToString(serverEphPub),
-		CSRFToken:                csrfToken,
-		TLSEndPoint:              base64.StdEncoding.EncodeToString(tlsEndPoint),
+	sa.appendAudit(username, "login2", "", "allow", ip, "")
+	writeJSON(w, http.StatusOK, map[string]string{
+		"sessionId":                sessionID,
+		"serverEphemeralPublicKey": base64.StdEncoding.EncodeToString(serverEphPub),
+		"csrfToken":                csrfToken,
 	})
+}
+
+func (sa *SecureAuth) genericAuthFailure(w http.ResponseWriter) {
+	http.Error(w, "authentication failed", http.StatusUnauthorized)
+}
+
+func (sa *SecureAuth) recordFailedAttempt(username, ip string) {
+	sa.appendAudit(username, "login2", "", "deny", ip, "")
 }
 
 // ---------------------------------------------------------------------------
@@ -1080,23 +1849,32 @@ func (sa *SecureAuth) handleLogin2(w http.ResponseWriter, r *http.Request) {
 
 func (sa *SecureAuth) handleGetPrivateKey(w http.ResponseWriter, r *http.Request, sess *sessionInfo) {
 	var (
-		encKey, nonce, salt []byte
-		kdfInfo             sql.NullString
+		encKey, nonce, salt             []byte
+		kdfInfo                         sql.NullString
+		encSignKey, signNonce, signSalt []byte
+		signKDFInfo                     sql.NullString
 	)
 	err := sa.db.QueryRow(
 		`SELECT encrypted_rsa_private_key, private_key_nonce,
-		        private_key_salt, private_key_kdf_info
+		        private_key_salt, private_key_kdf_info,
+		        encrypted_rsa_signing_private_key, signing_key_nonce,
+		        signing_key_salt, signing_key_kdf_info
 		 FROM `+tblUsers+` WHERE username = ?`, sess.UserID,
-	).Scan(&encKey, &nonce, &salt, &kdfInfo)
+	).Scan(&encKey, &nonce, &salt, &kdfInfo,
+		&encSignKey, &signNonce, &signSalt, &signKDFInfo)
 	if err != nil {
 		http.Error(w, "not found", http.StatusNotFound)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{
-		"encrypted_rsa_private_key": base64.StdEncoding.EncodeToString(encKey),
-		"private_key_nonce":         base64.StdEncoding.EncodeToString(nonce),
-		"private_key_salt":          base64.StdEncoding.EncodeToString(salt),
-		"private_key_kdf_info":      kdfInfo.String,
+		"encrypted_rsa_private_key":         base64.StdEncoding.EncodeToString(encKey),
+		"private_key_nonce":                 base64.StdEncoding.EncodeToString(nonce),
+		"private_key_salt":                  base64.StdEncoding.EncodeToString(salt),
+		"private_key_kdf_info":              kdfInfo.String,
+		"encrypted_rsa_signing_private_key": base64.StdEncoding.EncodeToString(encSignKey),
+		"signing_key_nonce":                 base64.StdEncoding.EncodeToString(signNonce),
+		"signing_key_salt":                  base64.StdEncoding.EncodeToString(signSalt),
+		"signing_key_kdf_info":              signKDFInfo.String,
 	})
 }
 
@@ -1119,7 +1897,7 @@ func (sa *SecureAuth) handleLogout(w http.ResponseWriter, r *http.Request) {
 	})
 	http.SetCookie(w, &http.Cookie{
 		Name: "secureauth_csrf", Value: "", Path: "/", MaxAge: -1,
-		Secure: true, HttpOnly: false, SameSite: http.SameSiteStrictMode,
+		Secure: true, HttpOnly: true, SameSite: http.SameSiteStrictMode,
 	})
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
@@ -1129,14 +1907,21 @@ func (sa *SecureAuth) handleLogout(w http.ResponseWriter, r *http.Request) {
 // ---------------------------------------------------------------------------
 
 type createUserRequest struct {
-	Username                 string `json:"username"`
-	Role                     string `json:"role"`
-	OpaqueRegistrationRecord string `json:"opaque_registration_record"`
-	RSAPublicKey             string `json:"rsa_public_key"`
-	EncryptedRSAPrivateKey   string `json:"encrypted_rsa_private_key"`
-	PrivateKeyNonce          string `json:"private_key_nonce"`
-	PrivateKeySalt           string `json:"private_key_salt"`
-	PrivateKeyKDFInfo        string `json:"private_key_kdf_info"`
+	Username               string `json:"username"`
+	Role                   string `json:"role"`
+	PendingRegID           string `json:"pendingRegId"`
+	RegistrationRecord     string `json:"registration_record"`
+	RSAPublicKey           string `json:"rsa_public_key"`
+	EncryptedRSAPrivateKey string `json:"encrypted_rsa_private_key"`
+	PrivateKeyNonce        string `json:"private_key_nonce"`
+	PrivateKeySalt         string `json:"private_key_salt"`
+	PrivateKeyKDFInfo      string `json:"private_key_kdf_info"`
+	RSASigningPublicKey    string `json:"rsa_signing_public_key"`
+	EncryptedRSASigningKey string `json:"encrypted_rsa_signing_private_key"`
+	SigningKeyNonce        string `json:"signing_key_nonce"`
+	SigningKeySalt         string `json:"signing_key_salt"`
+	SigningKeyKDFInfo      string `json:"signing_key_kdf_info"`
+	KSFSalt                string `json:"ksf_salt"`
 }
 
 func (sa *SecureAuth) handleCreateUser(w http.ResponseWriter, r *http.Request) {
@@ -1146,14 +1931,48 @@ func (sa *SecureAuth) handleCreateUser(w http.ResponseWriter, r *http.Request) {
 	}
 	var req createUserRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid request payload", http.StatusBadRequest)
+		return
+	}
+	if err := validateUsername(req.Username); err != nil {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
-	rec, err := base64.StdEncoding.DecodeString(req.OpaqueRegistrationRecord)
+
+	ksfSalt, err := base64.StdEncoding.DecodeString(req.KSFSalt)
+	if err != nil || len(ksfSalt) == 0 {
+		http.Error(w, "bad request: ksf_salt required", http.StatusBadRequest)
+		return
+	}
+
+	var (
+		credID  []byte
+		pending string
+	)
+	err = sa.db.QueryRow(
+		`SELECT credential_id, username FROM `+tblPendingRegs+` WHERE id = ?`,
+		req.PendingRegID,
+	).Scan(&credID, &pending)
+	if err != nil || pending != req.Username {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+
+	recBytes, err := base64.StdEncoding.DecodeString(req.RegistrationRecord)
+	if err != nil || len(recBytes) == 0 {
+		http.Error(w, "bad request: registration_record required", http.StatusBadRequest)
+		return
+	}
+	des, err := sa.opaqueConf.Deserializer()
 	if err != nil {
-		http.Error(w, "bad request", http.StatusBadRequest)
+		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
+	if _, err := des.RegistrationRecord(recBytes); err != nil {
+		http.Error(w, "bad request: registration_record invalid", http.StatusBadRequest)
+		return
+	}
+
 	pub, err := base64.StdEncoding.DecodeString(req.RSAPublicKey)
 	if err != nil {
 		http.Error(w, "bad request", http.StatusBadRequest)
@@ -1162,15 +1981,35 @@ func (sa *SecureAuth) handleCreateUser(w http.ResponseWriter, r *http.Request) {
 	encPriv, _ := base64.StdEncoding.DecodeString(req.EncryptedRSAPrivateKey)
 	nonce, _ := base64.StdEncoding.DecodeString(req.PrivateKeyNonce)
 	salt, _ := base64.StdEncoding.DecodeString(req.PrivateKeySalt)
+	signPub, _ := base64.StdEncoding.DecodeString(req.RSASigningPublicKey)
+	signEncPriv, _ := base64.StdEncoding.DecodeString(req.EncryptedRSASigningKey)
+	signNonce, _ := base64.StdEncoding.DecodeString(req.SigningKeyNonce)
+	signSalt, _ := base64.StdEncoding.DecodeString(req.SigningKeySalt)
+
+	tx, err := sa.db.BeginTx(r.Context(), nil)
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	defer tx.Rollback()
+
+	_, _ = tx.Exec(`DELETE FROM `+tblPendingRegs+` WHERE id = ?`, req.PendingRegID)
 
 	now := time.Now().UTC()
-	_, err = sa.db.Exec(
+	_, err = tx.Exec(
 		`INSERT INTO `+tblUsers+`
-		 (username, opaque_registration_record, rsa_public_key,
-		  encrypted_rsa_private_key, private_key_nonce, private_key_salt,
-		  private_key_kdf_info, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		req.Username, rec, pub, encPriv, nonce, salt, req.PrivateKeyKDFInfo,
+		 (username, opaque_registration_record, opaque_credential_id,
+		  rsa_public_key, encrypted_rsa_private_key, private_key_nonce,
+		  private_key_salt, private_key_kdf_info,
+		  rsa_signing_public_key, encrypted_rsa_signing_private_key,
+		  signing_key_nonce, signing_key_salt, signing_key_kdf_info,
+		  ksf_salt,
+		  created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		req.Username, recBytes, credID,
+		pub, encPriv, nonce, salt, req.PrivateKeyKDFInfo,
+		signPub, signEncPriv, signNonce, signSalt, req.SigningKeyKDFInfo,
+		ksfSalt,
 		now, now,
 	)
 	if err != nil {
@@ -1179,12 +2018,23 @@ func (sa *SecureAuth) handleCreateUser(w http.ResponseWriter, r *http.Request) {
 	}
 
 	roleID := "role-" + req.Role
-	_, _ = sa.db.Exec(
+	_, _ = tx.Exec(
 		`INSERT OR IGNORE INTO `+tblUserRoles+` (user_id, role_id) VALUES (?, ?)`,
 		req.Username, roleID,
 	)
 
-	sa.appendAudit("", "user.create", req.Username, "allow", clientIP(r), "")
+	if err := revokeStaleSharedKeysTx(tx, now); err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
+	if err := tx.Commit(); err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
+	actor := auditActor(r, "bootstrap")
+	sa.appendAudit(actor, "user.create", req.Username, "allow", sa.clientIP(r), "")
 	writeJSON(w, http.StatusOK, map[string]string{
 		"user_id":        req.Username,
 		"rsa_public_key": req.RSAPublicKey,
@@ -1203,15 +2053,35 @@ func (sa *SecureAuth) handleDeleteUser(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
+
 	now := time.Now().UTC()
-	_, _ = sa.db.Exec(`DELETE FROM `+tblUsers+` WHERE username = ?`, req.UserID)
-	_, _ = sa.db.Exec(`DELETE FROM `+tblSessions+` WHERE user_id = ?`, req.UserID)
-	_, _ = sa.db.Exec(
+	tx, err := sa.db.BeginTx(r.Context(), nil)
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	defer tx.Rollback()
+
+	_, _ = tx.Exec(`DELETE FROM `+tblUsers+` WHERE username = ?`, req.UserID)
+	_, _ = tx.Exec(`DELETE FROM `+tblSessions+` WHERE user_id = ?`, req.UserID)
+	_, _ = tx.Exec(
 		`UPDATE `+tblSharedKeys+` SET revoked_at = ?, revocation_reason = 'user deleted'
 		 WHERE user_id = ? AND revoked_at IS NULL`, now, req.UserID,
 	)
-	_, _ = sa.db.Exec(`DELETE FROM `+tblUserRoles+` WHERE user_id = ?`, req.UserID)
-	sa.appendAudit("", "user.delete", req.UserID, "allow", clientIP(r), "")
+	_, _ = tx.Exec(`DELETE FROM `+tblUserRoles+` WHERE user_id = ?`, req.UserID)
+
+	if err := revokeStaleSharedKeysTx(tx, now); err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
+	if err := tx.Commit(); err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
+	actor := auditActor(r, "")
+	sa.appendAudit(actor, "user.delete", req.UserID, "allow", sa.clientIP(r), "")
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
@@ -1265,14 +2135,22 @@ func (sa *SecureAuth) handleGetUsers(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]interface{}{"users": users})
 }
 
+// updateUserRequest intentionally has no NewUsername field: renaming a user
+// would invalidate the OPAQUE envelope (bound to the client identity), so the
+// library forbids it. Unknown JSON fields (including newUsername) are ignored
+// by encoding/json.
 type updateUserRequest struct {
-	UserID                   string `json:"userId"`
-	NewUsername              string `json:"newUsername,omitempty"`
-	NewRole                  string `json:"newRole,omitempty"`
-	OpaqueRegistrationRecord string `json:"opaque_registration_record,omitempty"`
-	EncryptedRSAPrivateKey   string `json:"encrypted_rsa_private_key,omitempty"`
-	PrivateKeyNonce          string `json:"private_key_nonce,omitempty"`
-	PrivateKeySalt           string `json:"private_key_salt,omitempty"`
+	UserID                 string `json:"userId"`
+	NewRole                string `json:"newRole,omitempty"`
+	PendingRegID           string `json:"pendingRegId,omitempty"`
+	RegistrationRecord     string `json:"registration_record,omitempty"`
+	EncryptedRSAPrivateKey string `json:"encrypted_rsa_private_key,omitempty"`
+	PrivateKeyNonce        string `json:"private_key_nonce,omitempty"`
+	PrivateKeySalt         string `json:"private_key_salt,omitempty"`
+	EncryptedRSASigningKey string `json:"encrypted_rsa_signing_private_key,omitempty"`
+	SigningKeyNonce        string `json:"signing_key_nonce,omitempty"`
+	SigningKeySalt         string `json:"signing_key_salt,omitempty"`
+	KSFSalt                string `json:"ksf_salt,omitempty"`
 }
 
 func (sa *SecureAuth) handleUpdateUser(w http.ResponseWriter, r *http.Request) {
@@ -1285,55 +2163,105 @@ func (sa *SecureAuth) handleUpdateUser(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
+
 	now := time.Now().UTC()
 
-	if req.NewUsername != "" {
-		_, err := sa.db.Exec(
-			`UPDATE `+tblUsers+` SET username = ?, updated_at = ? WHERE username = ?`,
-			req.NewUsername, now, req.UserID,
-		)
-		if err != nil {
-			http.Error(w, "conflict", http.StatusConflict)
+	tx, err := sa.db.BeginTx(r.Context(), nil)
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	defer tx.Rollback()
+
+	if req.PendingRegID != "" {
+		var credID []byte
+		var pendingUser string
+		err := tx.QueryRow(
+			`SELECT credential_id, username FROM `+tblPendingRegs+` WHERE id = ?`,
+			req.PendingRegID,
+		).Scan(&credID, &pendingUser)
+		if err != nil || pendingUser != req.UserID {
+			http.Error(w, "bad request", http.StatusBadRequest)
 			return
 		}
-		_, _ = sa.db.Exec(`UPDATE `+tblSessions+` SET user_id = ? WHERE user_id = ?`, req.NewUsername, req.UserID)
-		_, _ = sa.db.Exec(`UPDATE `+tblUserRoles+` SET user_id = ? WHERE user_id = ?`, req.NewUsername, req.UserID)
-		_, _ = sa.db.Exec(`UPDATE `+tblSharedKeys+` SET user_id = ? WHERE user_id = ?`, req.NewUsername, req.UserID)
-		req.UserID = req.NewUsername
-	}
+		_, _ = tx.Exec(`DELETE FROM `+tblPendingRegs+` WHERE id = ?`, req.PendingRegID)
 
-	if req.OpaqueRegistrationRecord != "" {
-		rec, _ := base64.StdEncoding.DecodeString(req.OpaqueRegistrationRecord)
+		if req.RegistrationRecord == "" {
+			http.Error(w, "bad request: registration_record required", http.StatusBadRequest)
+			return
+		}
+		recBytes, err := base64.StdEncoding.DecodeString(req.RegistrationRecord)
+		if err != nil || len(recBytes) == 0 {
+			http.Error(w, "bad request: registration_record invalid", http.StatusBadRequest)
+			return
+		}
+		des, err := sa.opaqueConf.Deserializer()
+		if err != nil {
+			http.Error(w, "internal error", http.StatusInternalServerError)
+			return
+		}
+		if _, err := des.RegistrationRecord(recBytes); err != nil {
+			http.Error(w, "bad request: registration_record invalid", http.StatusBadRequest)
+			return
+		}
+
+		ksfSalt, err := base64.StdEncoding.DecodeString(req.KSFSalt)
+		if err != nil || len(ksfSalt) == 0 {
+			http.Error(w, "bad request: ksf_salt required", http.StatusBadRequest)
+			return
+		}
+
 		encPriv, _ := base64.StdEncoding.DecodeString(req.EncryptedRSAPrivateKey)
 		nonce, _ := base64.StdEncoding.DecodeString(req.PrivateKeyNonce)
 		salt, _ := base64.StdEncoding.DecodeString(req.PrivateKeySalt)
-		_, err := sa.db.Exec(
-			`UPDATE `+tblUsers+` SET opaque_registration_record = ?,
+		signEncPriv, _ := base64.StdEncoding.DecodeString(req.EncryptedRSASigningKey)
+		signNonce, _ := base64.StdEncoding.DecodeString(req.SigningKeyNonce)
+		signSalt, _ := base64.StdEncoding.DecodeString(req.SigningKeySalt)
+
+		_, err = tx.Exec(
+			`UPDATE `+tblUsers+` SET
+			 opaque_registration_record = ?,
 			 encrypted_rsa_private_key = ?, private_key_nonce = ?,
-			 private_key_salt = ?, updated_at = ?
+			 private_key_salt = ?,
+			 encrypted_rsa_signing_private_key = ?, signing_key_nonce = ?,
+			 signing_key_salt = ?,
+			 ksf_salt = ?,
+			 updated_at = ?
 			 WHERE username = ?`,
-			rec, encPriv, nonce, salt, now, req.UserID,
+			recBytes,
+			encPriv, nonce, salt,
+			signEncPriv, signNonce, signSalt,
+			ksfSalt,
+			now, req.UserID,
 		)
 		if err != nil {
 			http.Error(w, "internal error", http.StatusInternalServerError)
 			return
 		}
+		_ = credID
 	}
 
 	if req.NewRole != "" {
-		_, _ = sa.db.Exec(
-			`UPDATE `+tblSharedKeys+` SET revoked_at = ?, revocation_reason = 'role change'
-			 WHERE user_id = ? AND revoked_at IS NULL`, now, req.UserID,
-		)
-		_, _ = sa.db.Exec(`DELETE FROM `+tblUserRoles+` WHERE user_id = ?`, req.UserID)
+		_, _ = tx.Exec(`DELETE FROM `+tblUserRoles+` WHERE user_id = ?`, req.UserID)
 		roleID := "role-" + req.NewRole
-		_, _ = sa.db.Exec(
+		_, _ = tx.Exec(
 			`INSERT OR IGNORE INTO `+tblUserRoles+` (user_id, role_id) VALUES (?, ?)`,
 			req.UserID, roleID,
 		)
 	}
 
-	sa.appendAudit("", "user.update", req.UserID, "allow", clientIP(r), "")
+	if err := revokeStaleSharedKeysTx(tx, now); err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
+	if err := tx.Commit(); err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
+	actor := auditActor(r, "")
+	sa.appendAudit(actor, "user.update", req.UserID, "allow", sa.clientIP(r), "")
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
@@ -1346,9 +2274,6 @@ type shareKeysRequest struct {
 	AuthorizationID string `json:"authorizationId"`
 	WrappedKey      string `json:"wrappedKey"`
 	AdminSignature  string `json:"adminSignature"`
-	ShareIndex      *int   `json:"shareIndex,omitempty"`
-	Threshold       *int   `json:"threshold,omitempty"`
-	TotalShares     *int   `json:"totalShares,omitempty"`
 	KeyVersion      int    `json:"keyVersion"`
 }
 
@@ -1363,38 +2288,100 @@ func (sa *SecureAuth) handleShareKeys(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	sess := sessionFrom(r)
+	if sess == nil {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
 	userID := req.UserID
-	if userID == "" && sess != nil {
+	if userID == "" {
 		userID = sess.UserID
+	}
+
+	var signPubBytes []byte
+	err := sa.db.QueryRow(
+		`SELECT rsa_signing_public_key FROM `+tblUsers+` WHERE username = ?`,
+		sess.UserID,
+	).Scan(&signPubBytes)
+	if err != nil || len(signPubBytes) == 0 {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	pubAny, err := x509.ParsePKIXPublicKey(signPubBytes)
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	rsaPub, ok := pubAny.(*rsa.PublicKey)
+	if !ok {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
 	}
 	wrapped, _ := base64.StdEncoding.DecodeString(req.WrappedKey)
 	sig, _ := base64.StdEncoding.DecodeString(req.AdminSignature)
-	now := time.Now().UTC()
 
-	// share_index is NULL for single-holder keys; SQLite treats NULLs as
-	// distinct in PRIMARY KEY constraints, so INSERT OR REPLACE is used.
-	_, err := sa.db.Exec(
+	digest := sha256.Sum256(wrapped)
+	if err := rsa.VerifyPSS(rsaPub, crypto.SHA256, digest[:], sig, nil); err != nil {
+		sa.appendAudit(sess.UserID, "sharekeys.write", req.AuthorizationID,
+			"deny", sa.clientIP(r), "bad signature")
+		http.Error(w, "bad signature", http.StatusBadRequest)
+		return
+	}
+
+	var targetPub []byte
+	err = sa.db.QueryRow(
+		`SELECT rsa_public_key FROM `+tblUsers+` WHERE username = ?`, userID,
+	).Scan(&targetPub)
+	if err != nil {
+		http.Error(w, "target user not found", http.StatusNotFound)
+		return
+	}
+
+	authName, err := sa.authorizationName(req.AuthorizationID)
+	if err != nil {
+		http.Error(w, "authorization not found", http.StatusNotFound)
+		return
+	}
+
+	hasAuth, err := sa.userHasPermission(userID, authName)
+	if err != nil || !hasAuth {
+		sa.appendAudit(sess.UserID, "sharekeys.write", req.AuthorizationID,
+			"deny", sa.clientIP(r), "target user lacks authorization")
+		http.Error(w, "target user does not have this authorization", http.StatusForbidden)
+		return
+	}
+
+	now := time.Now().UTC()
+	tx, err := sa.db.BeginTx(r.Context(), nil)
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	defer tx.Rollback()
+
+	_, _ = tx.Exec(
 		`DELETE FROM `+tblSharedKeys+`
 		 WHERE user_id = ? AND authorization_id = ? AND key_version = ?`,
 		userID, req.AuthorizationID, req.KeyVersion,
 	)
-	if err != nil {
-		http.Error(w, "internal error", http.StatusInternalServerError)
-		return
-	}
-	_, err = sa.db.Exec(
+	_, err = tx.Exec(
 		`INSERT INTO `+tblSharedKeys+`
 		 (user_id, authorization_id, wrapped_key, admin_signature,
-		  share_index, threshold, total_shares, key_version, created_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		userID, req.AuthorizationID, wrapped, sig,
-		req.ShareIndex, req.Threshold, req.TotalShares, req.KeyVersion, now,
+		  key_version, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?)`,
+		userID, req.AuthorizationID, wrapped, sig, req.KeyVersion, now,
 	)
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
-	sa.appendAudit(userID, "sharekeys.write", req.AuthorizationID, "allow", clientIP(r), "")
+	if err := tx.Commit(); err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
+	actor := auditActor(r, "")
+	sa.appendAudit(actor, "sharekeys.write", req.AuthorizationID, "allow",
+		sa.clientIP(r), "target="+userID)
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
@@ -1416,6 +2403,52 @@ func (sa *SecureAuth) handleSharedKeysCheck(w http.ResponseWriter, r *http.Reque
 		}
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{"authorizationIds": ids})
+}
+
+func (sa *SecureAuth) handleGetWrappedMasterkey(w http.ResponseWriter, r *http.Request, sess *sessionInfo) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		AuthorizationID string `json:"authorizationId"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+
+	authName, err := sa.authorizationName(req.AuthorizationID)
+	if err != nil {
+		http.Error(w, "authorization not found", http.StatusNotFound)
+		return
+	}
+	hasAuth, err := sa.userHasPermission(sess.UserID, authName)
+	if err != nil || !hasAuth {
+		sa.appendAudit(sess.UserID, "masterkey.get", req.AuthorizationID,
+			"deny", sa.clientIP(r), "lacks authorization")
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+
+	var wrapped []byte
+	var keyVersion int
+	err = sa.db.QueryRow(
+		`SELECT wrapped_key, key_version FROM `+tblSharedKeys+`
+		 WHERE user_id = ? AND authorization_id = ? AND revoked_at IS NULL
+		 ORDER BY key_version DESC LIMIT 1`,
+		sess.UserID, req.AuthorizationID,
+	).Scan(&wrapped, &keyVersion)
+	if err != nil {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+
+	sa.appendAudit(sess.UserID, "masterkey.get", req.AuthorizationID, "allow", sa.clientIP(r), "")
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"wrappedKey": base64.StdEncoding.EncodeToString(wrapped),
+		"keyVersion": keyVersion,
+	})
 }
 
 // ---------------------------------------------------------------------------
@@ -1451,7 +2484,15 @@ func (sa *SecureAuth) handleAddRole(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id := "role-" + hex.EncodeToString(randomBytes(8))
-	_, err := sa.db.Exec(
+
+	tx, err := sa.db.BeginTx(r.Context(), nil)
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	defer tx.Rollback()
+
+	_, err = tx.Exec(
 		`INSERT INTO `+tblRoles+` (id, name, description) VALUES (?, ?, ?)`,
 		id, req.Name, req.Description,
 	)
@@ -1460,10 +2501,14 @@ func (sa *SecureAuth) handleAddRole(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	for _, a := range req.Authorizations {
-		_, _ = sa.db.Exec(
+		_, _ = tx.Exec(
 			`INSERT OR IGNORE INTO `+tblRoleAuth+` (role_id, authorization_id) VALUES (?, ?)`,
 			id, a,
 		)
+	}
+	if err := tx.Commit(); err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"id": id})
 }
@@ -1479,20 +2524,42 @@ func (sa *SecureAuth) handleUpdateRole(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
+
+	now := time.Now().UTC()
+	tx, err := sa.db.BeginTx(r.Context(), nil)
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	defer tx.Rollback()
+
 	if req.Name != "" {
-		_, _ = sa.db.Exec(`UPDATE `+tblRoles+` SET name = ? WHERE id = ?`, req.Name, req.RoleID)
+		_, _ = tx.Exec(`UPDATE `+tblRoles+` SET name = ? WHERE id = ?`, req.Name, req.RoleID)
 	}
 	if req.Description != "" {
-		_, _ = sa.db.Exec(`UPDATE `+tblRoles+` SET description = ? WHERE id = ?`, req.Description, req.RoleID)
+		_, _ = tx.Exec(`UPDATE `+tblRoles+` SET description = ? WHERE id = ?`, req.Description, req.RoleID)
 	}
 	if req.Authorizations != nil {
-		_, _ = sa.db.Exec(`DELETE FROM `+tblRoleAuth+` WHERE role_id = ?`, req.RoleID)
+		_, _ = tx.Exec(`DELETE FROM `+tblRoleAuth+` WHERE role_id = ?`, req.RoleID)
 		for _, a := range req.Authorizations {
-			_, _ = sa.db.Exec(
+			_, _ = tx.Exec(
 				`INSERT OR IGNORE INTO `+tblRoleAuth+` (role_id, authorization_id) VALUES (?, ?)`,
 				req.RoleID, a,
 			)
 		}
+	}
+
+	// Revoke any shared key whose (user, authorization) is no longer backed
+	// by a role grant. This handles authorization removals from the updated
+	// role, and any other stale rows as a side effect.
+	if err := revokeStaleSharedKeysTx(tx, now); err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
+	if err := tx.Commit(); err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
@@ -1505,9 +2572,28 @@ func (sa *SecureAuth) handleDeleteRole(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
-	_, _ = sa.db.Exec(`DELETE FROM `+tblRoles+` WHERE id = ?`, req.RoleID)
-	_, _ = sa.db.Exec(`DELETE FROM `+tblRoleAuth+` WHERE role_id = ?`, req.RoleID)
-	_, _ = sa.db.Exec(`DELETE FROM `+tblUserRoles+` WHERE role_id = ?`, req.RoleID)
+
+	now := time.Now().UTC()
+	tx, err := sa.db.BeginTx(r.Context(), nil)
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	defer tx.Rollback()
+
+	_, _ = tx.Exec(`DELETE FROM `+tblRoles+` WHERE id = ?`, req.RoleID)
+	_, _ = tx.Exec(`DELETE FROM `+tblRoleAuth+` WHERE role_id = ?`, req.RoleID)
+	_, _ = tx.Exec(`DELETE FROM `+tblUserRoles+` WHERE role_id = ?`, req.RoleID)
+
+	if err := revokeStaleSharedKeysTx(tx, now); err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
+	if err := tx.Commit(); err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
@@ -1517,7 +2603,7 @@ func (sa *SecureAuth) handleDeleteRole(w http.ResponseWriter, r *http.Request) {
 
 func (sa *SecureAuth) handleGetAuthorizations(w http.ResponseWriter, r *http.Request) {
 	rows, err := sa.db.Query(
-		`SELECT id, name, description, is_threshold FROM ` + tblAuthorizations,
+		`SELECT id, name, description FROM ` + tblAuthorizations,
 	)
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
@@ -1527,13 +2613,11 @@ func (sa *SecureAuth) handleGetAuthorizations(w http.ResponseWriter, r *http.Req
 	var auths []map[string]interface{}
 	for rows.Next() {
 		var id, name, desc string
-		var isThreshold int
-		if err := rows.Scan(&id, &name, &desc, &isThreshold); err != nil {
+		if err := rows.Scan(&id, &name, &desc); err != nil {
 			continue
 		}
 		auths = append(auths, map[string]interface{}{
 			"id": id, "name": name, "description": desc,
-			"is_threshold": isThreshold != 0,
 		})
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{"authorizations": auths})
@@ -1543,22 +2627,16 @@ func (sa *SecureAuth) handleAddAuthorization(w http.ResponseWriter, r *http.Requ
 	var req struct {
 		Name        string `json:"name"`
 		Description string `json:"description"`
-		IsThreshold bool   `json:"isThreshold"`
-		PublicKey   string `json:"publicKey,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
 	id := "auth-" + hex.EncodeToString(randomBytes(8))
-	var pub []byte
-	if req.PublicKey != "" {
-		pub, _ = base64.StdEncoding.DecodeString(req.PublicKey)
-	}
 	_, err := sa.db.Exec(
-		`INSERT INTO `+tblAuthorizations+` (id, name, description, is_threshold, public_key)
-		 VALUES (?, ?, ?, ?, ?)`,
-		id, req.Name, req.Description, boolToInt(req.IsThreshold), pub,
+		`INSERT INTO `+tblAuthorizations+` (id, name, description)
+		 VALUES (?, ?, ?)`,
+		id, req.Name, req.Description,
 	)
 	if err != nil {
 		http.Error(w, "conflict", http.StatusConflict)
@@ -1594,165 +2672,468 @@ func (sa *SecureAuth) handleDeleteAuthorization(w http.ResponseWriter, r *http.R
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
+
 	now := time.Now().UTC()
-	_, _ = sa.db.Exec(
+	tx, err := sa.db.BeginTx(r.Context(), nil)
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	defer tx.Rollback()
+
+	_, _ = tx.Exec(
 		`UPDATE `+tblSharedKeys+` SET revoked_at = ?, revocation_reason = 'authorization deleted'
 		 WHERE authorization_id = ? AND revoked_at IS NULL`, now, req.AuthID,
 	)
-	_, _ = sa.db.Exec(`DELETE FROM `+tblAuthorizations+` WHERE id = ?`, req.AuthID)
-	_, _ = sa.db.Exec(`DELETE FROM `+tblRoleAuth+` WHERE authorization_id = ?`, req.AuthID)
+	_, _ = tx.Exec(`DELETE FROM `+tblAuthorizations+` WHERE id = ?`, req.AuthID)
+	_, _ = tx.Exec(`DELETE FROM `+tblRoleAuth+` WHERE authorization_id = ?`, req.AuthID)
+
+	if err := revokeStaleSharedKeysTx(tx, now); err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
+	if err := tx.Commit(); err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
-func (sa *SecureAuth) handleAuthorizationPublicKey(w http.ResponseWriter, r *http.Request, _ *sessionInfo) {
-	var req struct {
-		AuthID string `json:"authId"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "bad request", http.StatusBadRequest)
-		return
-	}
-	var pub []byte
-	err := sa.db.QueryRow(
-		`SELECT public_key FROM `+tblAuthorizations+` WHERE id = ?`, req.AuthID,
-	).Scan(&pub)
-	if err != nil {
-		http.Error(w, "not found", http.StatusNotFound)
-		return
-	}
-	if len(pub) == 0 {
-		http.Error(w, "no public key", http.StatusNotFound)
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]string{
-		"publicKey": base64.StdEncoding.EncodeToString(pub),
-	})
+// ---------------------------------------------------------------------------
+// Encrypted data store
+// ---------------------------------------------------------------------------
+
+func (sa *SecureAuth) userHasActiveKey(userID, authorizationID string) bool {
+	var count int
+	_ = sa.db.QueryRow(
+		`SELECT COUNT(*) FROM `+tblSharedKeys+`
+		 WHERE user_id = ? AND authorization_id = ? AND revoked_at IS NULL`,
+		userID, authorizationID,
+	).Scan(&count)
+	return count > 0
 }
 
-// ---------------------------------------------------------------------------
-// Threshold orchestration (server stores; clients compute)
-// ---------------------------------------------------------------------------
+// checkDataAccess verifies that the session user both has the permission the
+// authorization grants and holds a non-revoked shared key for it. Returns
+// (authName, true) on success.
+func (sa *SecureAuth) checkDataAccess(sess *sessionInfo, authID string) (string, bool) {
+	authName, err := sa.authorizationName(authID)
+	if err != nil {
+		return "", false
+	}
+	ok, err := sa.userHasPermission(sess.UserID, authName)
+	if err != nil || !ok {
+		return authName, false
+	}
+	if !sa.userHasActiveKey(sess.UserID, authID) {
+		return authName, false
+	}
+	return authName, true
+}
 
-func (sa *SecureAuth) handleThresholdEncrypt(w http.ResponseWriter, r *http.Request, sess *sessionInfo) {
+func (sa *SecureAuth) handleDataPut(w http.ResponseWriter, r *http.Request, sess *sessionInfo) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
 	var req struct {
 		AuthorizationID string `json:"authorizationId"`
+		ID              string `json:"id,omitempty"`
 		KeyVersion      int    `json:"keyVersion"`
-		C1              string `json:"c1"`
-		C2              string `json:"c2"`
-		Ciphertext      string `json:"ciphertext"`
 		Nonce           string `json:"nonce"`
+		Ciphertext      string `json:"ciphertext"`
+		Label           string `json:"label,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
-	c1, _ := base64.StdEncoding.DecodeString(req.C1)
-	c2, _ := base64.StdEncoding.DecodeString(req.C2)
-	ct, _ := base64.StdEncoding.DecodeString(req.Ciphertext)
-	nonce, _ := base64.StdEncoding.DecodeString(req.Nonce)
-	id := hex.EncodeToString(randomBytes(16))
-	_, err := sa.db.Exec(
-		`INSERT INTO `+tblThresholdCT+`
-		 (id, authorization_id, key_version, c1, c2, ciphertext, nonce, created_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		id, req.AuthorizationID, req.KeyVersion, c1, c2, ct, nonce, time.Now().UTC(),
+
+	if _, ok := sa.checkDataAccess(sess, req.AuthorizationID); !ok {
+		sa.appendAudit(sess.UserID, "data.put", req.AuthorizationID,
+			"deny", sa.clientIP(r), "no permission or active key")
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+
+	nonce, err := base64.StdEncoding.DecodeString(req.Nonce)
+	if err != nil {
+		http.Error(w, "bad request: nonce", http.StatusBadRequest)
+		return
+	}
+	ct, err := base64.StdEncoding.DecodeString(req.Ciphertext)
+	if err != nil {
+		http.Error(w, "bad request: ciphertext", http.StatusBadRequest)
+		return
+	}
+	id := req.ID
+	if id == "" {
+		id = hex.EncodeToString(randomBytes(16))
+	}
+	now := time.Now().UTC()
+
+	tx, err := sa.db.BeginTx(r.Context(), nil)
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	defer tx.Rollback()
+
+	// Reject cross-authorization overwrite: if a row with this id already
+	// exists, its authorization_id must match the request.
+	var existingAuthID string
+	err = tx.QueryRow(
+		`SELECT authorization_id FROM `+tblEncryptedData+` WHERE id = ?`, id,
+	).Scan(&existingAuthID)
+	if err == nil && existingAuthID != req.AuthorizationID {
+		http.Error(w, "conflict: id belongs to a different authorization", http.StatusConflict)
+		return
+	}
+	if err != nil && err != sql.ErrNoRows {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
+	_, err = tx.Exec(
+		`INSERT INTO `+tblEncryptedData+`
+		 (id, authorization_id, owner_id, key_version, nonce, ciphertext, label, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		 ON CONFLICT(id) DO UPDATE SET
+		   nonce=excluded.nonce, ciphertext=excluded.ciphertext,
+		   label=excluded.label, key_version=excluded.key_version,
+		   updated_at=excluded.updated_at`,
+		id, req.AuthorizationID, sess.UserID, req.KeyVersion, nonce, ct, req.Label, now, now,
 	)
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
-	sa.appendAudit(sess.UserID, "threshold.encrypt", req.AuthorizationID, "allow", clientIP(r), "")
+	if err := tx.Commit(); err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
+	sa.appendAudit(sess.UserID, "data.put", req.AuthorizationID, "allow", sa.clientIP(r), "id="+id)
 	writeJSON(w, http.StatusOK, map[string]string{"id": id})
 }
 
-func (sa *SecureAuth) handleThresholdShare(w http.ResponseWriter, r *http.Request, sess *sessionInfo) {
+func (sa *SecureAuth) handleDataGet(w http.ResponseWriter, r *http.Request, sess *sessionInfo) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
 	var req struct {
-		AuthorizationID string `json:"authorizationId"`
+		ID string `json:"id"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
 	var (
-		wrapped []byte
-		idx     sql.NullInt64
+		authID     string
+		keyVersion int
+		nonce      []byte
+		ct         []byte
+		label      sql.NullString
 	)
 	err := sa.db.QueryRow(
-		`SELECT wrapped_key, share_index FROM `+tblSharedKeys+`
-		 WHERE user_id = ? AND authorization_id = ? AND revoked_at IS NULL
-		 ORDER BY key_version DESC, share_index ASC LIMIT 1`,
-		sess.UserID, req.AuthorizationID,
-	).Scan(&wrapped, &idx)
+		`SELECT authorization_id, key_version, nonce, ciphertext, label
+		 FROM `+tblEncryptedData+` WHERE id = ?`, req.ID,
+	).Scan(&authID, &keyVersion, &nonce, &ct, &label)
 	if err != nil {
 		http.Error(w, "not found", http.StatusNotFound)
 		return
 	}
+	if _, ok := sa.checkDataAccess(sess, authID); !ok {
+		sa.appendAudit(sess.UserID, "data.get", authID,
+			"deny", sa.clientIP(r), "no permission or active key for id="+req.ID)
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	sa.appendAudit(sess.UserID, "data.get", authID, "allow", sa.clientIP(r), "id="+req.ID)
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"wrappedShare": base64.StdEncoding.EncodeToString(wrapped),
-		"shareIndex":   int(idx.Int64),
+		"id":              req.ID,
+		"authorizationId": authID,
+		"keyVersion":      keyVersion,
+		"nonce":           base64.StdEncoding.EncodeToString(nonce),
+		"ciphertext":      base64.StdEncoding.EncodeToString(ct),
+		"label":           label.String,
 	})
 }
 
-func (sa *SecureAuth) handleThresholdPartial(w http.ResponseWriter, r *http.Request, sess *sessionInfo) {
+func (sa *SecureAuth) handleDataDelete(w http.ResponseWriter, r *http.Request, sess *sessionInfo) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
 	var req struct {
-		CiphertextID string `json:"ciphertextId"`
-		ShareIndex   int    `json:"shareIndex"`
-		Partial      string `json:"partial"`
+		ID string `json:"id"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
-	partial, err := base64.StdEncoding.DecodeString(req.Partial)
-	if err != nil {
-		http.Error(w, "bad request", http.StatusBadRequest)
-		return
-	}
-	_, err = sa.db.Exec(
-		`INSERT OR REPLACE INTO `+tblThresholdParts+`
-		 (ciphertext_id, share_index, user_id, partial, created_at)
-		 VALUES (?, ?, ?, ?, ?)`,
-		req.CiphertextID, req.ShareIndex, sess.UserID, partial, time.Now().UTC(),
-	)
+
+	tx, err := sa.db.BeginTx(r.Context(), nil)
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
-	sa.appendAudit(sess.UserID, "threshold.partial", req.CiphertextID, "allow", clientIP(r), "")
+	defer tx.Rollback()
+
+	var authID string
+	err = tx.QueryRow(
+		`SELECT authorization_id FROM `+tblEncryptedData+` WHERE id = ?`, req.ID,
+	).Scan(&authID)
+	if err != nil {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	if _, ok := sa.checkDataAccess(sess, authID); !ok {
+		sa.appendAudit(sess.UserID, "data.delete", authID,
+			"deny", sa.clientIP(r), "no permission or active key for id="+req.ID)
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	_, _ = tx.Exec(`DELETE FROM `+tblEncryptedData+` WHERE id = ?`, req.ID)
+	if err := tx.Commit(); err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	sa.appendAudit(sess.UserID, "data.delete", authID, "allow", sa.clientIP(r), "id="+req.ID)
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
-func (sa *SecureAuth) handleThresholdPartials(w http.ResponseWriter, r *http.Request, _ *sessionInfo) {
+func (sa *SecureAuth) handleDataList(w http.ResponseWriter, r *http.Request, sess *sessionInfo) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
 	var req struct {
-		CiphertextID string `json:"ciphertextId"`
+		AuthorizationID string `json:"authorizationId"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
+	if _, ok := sa.checkDataAccess(sess, req.AuthorizationID); !ok {
+		sa.appendAudit(sess.UserID, "data.list", req.AuthorizationID,
+			"deny", sa.clientIP(r), "no permission or active key")
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
 	rows, err := sa.db.Query(
-		`SELECT share_index, partial FROM `+tblThresholdParts+`
-		 WHERE ciphertext_id = ? ORDER BY share_index`,
-		req.CiphertextID,
+		`SELECT id, label, key_version, updated_at FROM `+tblEncryptedData+`
+		 WHERE authorization_id = ? ORDER BY updated_at DESC`, req.AuthorizationID,
 	)
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
 	defer rows.Close()
-	var partials []map[string]interface{}
+	var records []map[string]interface{}
 	for rows.Next() {
-		var idx int
-		var partial []byte
-		if err := rows.Scan(&idx, &partial); err != nil {
+		var id string
+		var label sql.NullString
+		var kv int
+		var upd time.Time
+		if err := rows.Scan(&id, &label, &kv, &upd); err != nil {
 			continue
 		}
-		partials = append(partials, map[string]interface{}{
-			"shareIndex": idx,
-			"partial":    base64.StdEncoding.EncodeToString(partial),
+		records = append(records, map[string]interface{}{
+			"id":         id,
+			"label":      label.String,
+			"keyVersion": kv,
+			"updatedAt":  upd,
 		})
 	}
-	writeJSON(w, http.StatusOK, map[string]interface{}{"partials": partials})
+	writeJSON(w, http.StatusOK, map[string]interface{}{"records": records})
+}
+
+// ---------------------------------------------------------------------------
+// Bootstrap endpoints
+// ---------------------------------------------------------------------------
+
+func (sa *SecureAuth) handleBootstrapCredentials(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	notAvailable := func() {
+		writeJSON(w, http.StatusOK, map[string]interface{}{"available": false})
+	}
+
+	var count int
+	_ = sa.db.QueryRow(`SELECT COUNT(*) FROM ` + tblUsers).Scan(&count)
+	if count > 0 {
+		notAvailable()
+		return
+	}
+
+	var username string
+	var sealedPwd []byte
+	var consumed int
+	err := sa.db.QueryRow(
+		`SELECT username, sealed_password, consumed FROM `+tblBootstrap+` WHERE id = 1`,
+	).Scan(&username, &sealedPwd, &consumed)
+	if err != nil || consumed != 0 {
+		notAvailable()
+		return
+	}
+
+	pwd, err := sa.open(sealedPwd, []byte("secureauth:bootstrap-password:v1"))
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"available":      true,
+		"username":       username,
+		"password":       string(pwd),
+		"bootstrapToken": string(sa.bootstrapToken),
+	})
+}
+
+func (sa *SecureAuth) handleBootstrapFirstUser(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	sess, err := sa.loadSessionInfo(r)
+	if err != nil {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	var consumed int
+	err = sa.db.QueryRow(
+		`SELECT consumed FROM ` + tblBootstrap + ` WHERE id = 1`,
+	).Scan(&consumed)
+	if err != nil || consumed != 0 {
+		http.Error(w, "bootstrap already completed", http.StatusGone)
+		return
+	}
+
+	var req struct {
+		WrappedKeys []struct {
+			AuthorizationID string `json:"authorizationId"`
+			WrappedKey      string `json:"wrappedKey"`
+			AdminSignature  string `json:"adminSignature"`
+			KeyVersion      int    `json:"keyVersion"`
+		} `json:"wrappedKeys"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+
+	var signPubBytes []byte
+	err = sa.db.QueryRow(
+		`SELECT rsa_signing_public_key FROM `+tblUsers+` WHERE username = ?`,
+		sess.UserID,
+	).Scan(&signPubBytes)
+	if err != nil || len(signPubBytes) == 0 {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	pubAny, err := x509.ParsePKIXPublicKey(signPubBytes)
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	rsaPub, ok := pubAny.(*rsa.PublicKey)
+	if !ok {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
+	now := time.Now().UTC()
+	tx, err := sa.db.BeginTx(r.Context(), nil)
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	defer tx.Rollback()
+
+	for _, wk := range req.WrappedKeys {
+		wrapped, _ := base64.StdEncoding.DecodeString(wk.WrappedKey)
+		sig, _ := base64.StdEncoding.DecodeString(wk.AdminSignature)
+		digest := sha256.Sum256(wrapped)
+		if err := rsa.VerifyPSS(rsaPub, crypto.SHA256, digest[:], sig, nil); err != nil {
+			sa.appendAudit(sess.UserID, "bootstrap.first-user", wk.AuthorizationID,
+				"deny", sa.clientIP(r), "bad signature")
+			http.Error(w, "bad signature for authorizationId="+wk.AuthorizationID, http.StatusBadRequest)
+			return
+		}
+		_, _ = tx.Exec(
+			`DELETE FROM `+tblSharedKeys+`
+			 WHERE user_id = ? AND authorization_id = ? AND key_version = ?`,
+			sess.UserID, wk.AuthorizationID, wk.KeyVersion,
+		)
+		_, err = tx.Exec(
+			`INSERT INTO `+tblSharedKeys+`
+			 (user_id, authorization_id, wrapped_key, admin_signature, key_version, created_at)
+			 VALUES (?, ?, ?, ?, ?, ?)`,
+			sess.UserID, wk.AuthorizationID, wrapped, sig, wk.KeyVersion, now,
+		)
+		if err != nil {
+			http.Error(w, "internal error", http.StatusInternalServerError)
+			return
+		}
+	}
+
+	_, _ = tx.Exec(`UPDATE ` + tblBootstrap + ` SET consumed = 1 WHERE id = 1`)
+
+	if err := tx.Commit(); err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
+	sa.appendAudit(sess.UserID, "bootstrap.first-user", "", "allow", sa.clientIP(r),
+		fmt.Sprintf("wrapped %d keys", len(req.WrappedKeys)))
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func (sa *SecureAuth) handleBootstrapMasterkeysPending(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	sess, err := sa.loadSessionInfo(r)
+	if err != nil {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	var consumed int
+	var sealedMK []byte
+	err = sa.db.QueryRow(
+		`SELECT consumed, sealed_masterkeys FROM `+tblBootstrap+` WHERE id = 1`,
+	).Scan(&consumed, &sealedMK)
+	if err != nil || consumed != 0 {
+		http.Error(w, "not available", http.StatusGone)
+		return
+	}
+
+	mkJSON, err := sa.open(sealedMK, []byte("secureauth:bootstrap-masterkeys:v1"))
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
+	var mkMap map[string]string
+	if err := json.Unmarshal(mkJSON, &mkMap); err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
+	sa.appendAudit(sess.UserID, "bootstrap.masterkeys-pending", "", "allow", sa.clientIP(r), "")
+	writeJSON(w, http.StatusOK, map[string]interface{}{"masterkeys": mkMap})
 }
 
 // ---------------------------------------------------------------------------
@@ -1852,11 +3233,26 @@ func (sa *SecureAuth) handleIndex(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "template not configured", http.StatusNotFound)
 		return
 	}
+
 	importMap := `<script type="importmap" nonce="` + nonce + `">` + importMapJSON() + `</script>`
-	moduleScript := `<script type="module" nonce="` + nonce + `">` +
-		`import { SecureAuth } from "/static/secureauth.mjs"; window.SecureAuth = SecureAuth;` +
+
+	// Boot: import the module and start init(). Expose the resulting promise
+	// on window.__sa_ready so the per-page script can await it.
+	bootScript := `<script type="module" nonce="` + nonce + `">` +
+		`import { SecureAuth } from "/static/secureauth.mjs"; ` +
+		`window.SecureAuth = SecureAuth; ` +
+		`window.__sa_ready = SecureAuth.init().catch(function (e) { ` +
+		`console.error("SecureAuth.init failed", e); }); ` +
 		`</script>`
-	injection := importMap + moduleScript
+
+	pageScript := ""
+	if body, ok := pageScripts[page]; ok && body != "" {
+		pageScript = `<script type="module" nonce="` + nonce + `">` +
+			`await window.__sa_ready; ` + body + `</script>`
+	}
+
+	injection := importMap + bootScript + pageScript
+
 	var buf strings.Builder
 	if err := t.Execute(&buf, nil); err != nil {
 		http.Error(w, "template error", http.StatusInternalServerError)
@@ -1870,19 +3266,438 @@ func (sa *SecureAuth) handleIndex(w http.ResponseWriter, r *http.Request) {
 func importMapJSON() string {
 	m := map[string]interface{}{
 		"imports": map[string]string{
-			"@serenity-kit/opaque": "https://cdn.jsdelivr.net/npm/@serenity-kit/opaque@1.1.0/+esm",
-			"@noble/ciphers":       "https://cdn.jsdelivr.net/npm/@noble/ciphers@2.3.0/+esm",
-			"@noble/curves":        "https://cdn.jsdelivr.net/npm/@noble/curves@2.4.0/+esm",
-			"@noble/hashes":        "https://cdn.jsdelivr.net/npm/@noble/hashes@2.2.0/+esm",
+			"@noble/ciphers/": "https://cdn.jsdelivr.net/npm/@noble/ciphers@2.3.0/",
+			"@noble/curves/":  "https://cdn.jsdelivr.net/npm/@noble/curves@2.4.0/",
+			"@noble/hashes/":  "https://cdn.jsdelivr.net/npm/@noble/hashes@2.2.0/",
 		},
 	}
 	b, _ := json.Marshal(m)
 	return string(b)
 }
 
-func (sa *SecureAuth) handleServeJS(w http.ResponseWriter, r *http.Request) {
+// ---------------------------------------------------------------------------
+// Per-page module scripts (injected after the boot script)
+//
+// These are raw Go strings; no backticks. They run with top-level await
+// after SecureAuth.init() has resolved.
+// ---------------------------------------------------------------------------
+
+// sharedShellScript adds a nav bar to non-login pages. Prepended to users,
+// roles, and authorizations page scripts.
+const sharedShellScript = `
+(function () {
+  var nav = document.createElement("nav");
+  nav.innerHTML =
+    '<a href="/users">Users</a> | ' +
+    '<a href="/roles">Roles</a> | ' +
+    '<a href="/authorizations">Authorizations</a> | ' +
+    '<button id="sa-logout">Logout</button>';
+  document.body.insertBefore(nav, document.body.firstChild);
+  document.getElementById("sa-logout").addEventListener("click", async function () {
+    try { await window.SecureAuth.logout(); } catch (e) {}
+    location.href = "/login";
+  });
+})();
+`
+
+const loginPageScript = `
+(function () {
+  var form = document.querySelector("form#f");
+  var out = document.querySelector("#out");
+  if (!form) return;
+  form.addEventListener("submit", async function (e) {
+    e.preventDefault();
+    var fd = new FormData(form);
+    out.textContent = "Signing in\u2026";
+    try {
+      await window.SecureAuth.login(fd.get("username"), fd.get("password"));
+      sessionStorage.setItem("secureauth_logged_in", "1");
+      out.textContent = "Signed in. Redirecting\u2026";
+      setTimeout(function () { location.href = "/users"; }, 200);
+    } catch (err) {
+      console.error(err);
+      out.textContent = "Login failed: " + err.message;
+    }
+  });
+})();
+`
+
+const usersPageScript = sharedShellScript + `
+(function () {
+  var sa = window.SecureAuth;
+  var root = document.querySelector("#out");
+  if (!root) {
+    root = document.createElement("div");
+    document.body.appendChild(root);
+  }
+  root.innerHTML = "";
+
+  // --- create user ---
+  var createForm = document.createElement("form");
+  createForm.innerHTML =
+    '<h3>Create user</h3>' +
+    '<input name="username" placeholder="username" required> ' +
+    '<input name="password" type="password" placeholder="password" required> ' +
+    '<select name="role">' +
+      '<option>Viewer</option><option>Manager</option>' +
+      '<option>Admin</option><option>SuperAdmin</option>' +
+    '</select> ' +
+    '<button>Create</button>';
+  createForm.addEventListener("submit", async function (e) {
+    e.preventDefault();
+    var fd = new FormData(createForm);
+    try {
+      await sa.createUser(fd.get("username"), fd.get("password"), fd.get("role"));
+      createForm.reset();
+      refresh();
+    } catch (err) {
+      alert("Create failed: " + err.message);
+    }
+  });
+  root.appendChild(createForm);
+
+  // --- table ---
+  var table = document.createElement("table");
+  table.border = "1";
+  table.style.borderCollapse = "collapse";
+  table.style.marginTop = "12px";
+  table.innerHTML = "<thead><tr>" +
+    "<th>Username</th><th>Roles</th><th>Actions</th>" +
+    "</tr></thead>";
+  var tbody = document.createElement("tbody");
+  table.appendChild(tbody);
+  root.appendChild(table);
+
+  // --- edit panel ---
+  var editPanel = document.createElement("div");
+  editPanel.style.marginTop = "12px";
+  root.appendChild(editPanel);
+
+  async function refresh() {
+    tbody.innerHTML = "";
+    try {
+      var res = await sa.getUsers();
+      var users = res.users || [];
+      for (var i = 0; i < users.length; i++) {
+        tbody.appendChild(renderRow(users[i]));
+      }
+    } catch (err) {
+      var tr = document.createElement("tr");
+      var td = document.createElement("td");
+      td.colSpan = 3;
+      td.textContent = "Error: " + err.message;
+      tr.appendChild(td);
+      tbody.appendChild(tr);
+    }
+  }
+
+  function renderRow(u) {
+    var tr = document.createElement("tr");
+    var td1 = document.createElement("td");
+    td1.textContent = u.username;
+    var td2 = document.createElement("td");
+    td2.textContent = (u.roles || []).join(", ");
+    var td3 = document.createElement("td");
+
+    var editBtn = document.createElement("button");
+    editBtn.textContent = "Edit";
+    editBtn.addEventListener("click", function () { showEdit(u); });
+    td3.appendChild(editBtn);
+
+    var delBtn = document.createElement("button");
+    delBtn.textContent = "Delete";
+    delBtn.style.marginLeft = "4px";
+    delBtn.addEventListener("click", async function () {
+      if (!confirm("Delete user " + u.username + "?")) return;
+      try { await sa.deleteUser(u.username); refresh(); }
+      catch (err) { alert("Delete failed: " + err.message); }
+    });
+    td3.appendChild(delBtn);
+
+    tr.appendChild(td1); tr.appendChild(td2); tr.appendChild(td3);
+    return tr;
+  }
+
+  function showEdit(u) {
+    editPanel.innerHTML = "";
+    var h = document.createElement("h3");
+    h.textContent = "Edit " + u.username;
+    editPanel.appendChild(h);
+
+    var form = document.createElement("form");
+    form.innerHTML =
+      '<label>New role: <select name="newRole">' +
+        '<option value="">(unchanged)</option>' +
+        '<option>Viewer</option><option>Manager</option>' +
+        '<option>Admin</option><option>SuperAdmin</option>' +
+      '</select></label> ' +
+      '<label>New password: <input name="password" type="password" placeholder="(unchanged)"></label> ' +
+      '<button>Save</button> <button type="button" id="sa-cancel">Cancel</button>';
+    form.addEventListener("submit", async function (e) {
+      e.preventDefault();
+      var fd = new FormData(form);
+      var changes = {};
+      var nr = fd.get("newRole");
+      if (nr) changes.newRole = nr;
+      var np = fd.get("password");
+      if (np) changes.password = np;
+      if (Object.keys(changes).length === 0) { editPanel.innerHTML = ""; return; }
+      try {
+        await sa.updateUser(u.username, changes);
+        editPanel.innerHTML = "";
+        refresh();
+      } catch (err) {
+        alert("Update failed: " + err.message);
+      }
+    });
+    form.querySelector("#sa-cancel").addEventListener("click", function () {
+      editPanel.innerHTML = "";
+    });
+    editPanel.appendChild(form);
+  }
+
+  refresh();
+})();
+`
+
+const rolesPageScript = sharedShellScript + `
+(function () {
+  var sa = window.SecureAuth;
+  var container = document.createElement("div");
+  container.innerHTML =
+    '<h2>Roles</h2>' +
+    '<form id="sa-role-add">' +
+      '<input name="name" placeholder="role name" required> ' +
+      '<input name="description" placeholder="description"> ' +
+      '<button>Add role</button>' +
+    '</form>' +
+    '<div id="sa-role-list">loading\u2026</div>';
+  document.body.appendChild(container);
+
+  var list = container.querySelector("#sa-role-list");
+  var addForm = container.querySelector("#sa-role-add");
+
+  addForm.addEventListener("submit", async function (e) {
+    e.preventDefault();
+    var fd = new FormData(addForm);
+    try {
+      await sa.addRole({ name: fd.get("name"), description: fd.get("description") });
+      addForm.reset();
+      refresh();
+    } catch (err) { alert("Add failed: " + err.message); }
+  });
+
+  async function refresh() {
+    list.innerHTML = "loading\u2026";
+    try {
+      var res = await sa.getRoles();
+      var roles = res.roles || [];
+      list.innerHTML = "";
+      var table = document.createElement("table");
+      table.border = "1";
+      table.style.borderCollapse = "collapse";
+      table.innerHTML = "<thead><tr><th>ID</th><th>Name</th>" +
+        "<th>Description</th><th>Actions</th></tr></thead>";
+      var tbody = document.createElement("tbody");
+      for (var i = 0; i < roles.length; i++) {
+        var r = roles[i];
+        var tr = document.createElement("tr");
+        var td1 = document.createElement("td"); td1.textContent = r.id;
+        var td2 = document.createElement("td"); td2.textContent = r.name;
+        var td3 = document.createElement("td"); td3.textContent = r.description || "";
+        var td4 = document.createElement("td");
+
+        var delBtn = document.createElement("button");
+        delBtn.textContent = "Delete";
+        delBtn.addEventListener("click", async function (role) {
+          return async function () {
+            if (!confirm("Delete role " + role.name + "?")) return;
+            try { await sa.deleteRole(role.id); refresh(); }
+            catch (err) { alert("Delete failed: " + err.message); }
+          };
+        }(r));
+        td4.appendChild(delBtn);
+
+        tr.appendChild(td1); tr.appendChild(td2);
+        tr.appendChild(td3); tr.appendChild(td4);
+        tbody.appendChild(tr);
+      }
+      table.appendChild(tbody);
+      list.appendChild(table);
+    } catch (err) {
+      list.textContent = "Error: " + err.message;
+    }
+  }
+
+  refresh();
+})();
+`
+
+const authsPageScript = sharedShellScript + `
+(function () {
+  var sa = window.SecureAuth;
+  var container = document.createElement("div");
+  container.innerHTML =
+    '<h2>Authorizations</h2>' +
+    '<form id="sa-auth-add">' +
+      '<input name="name" placeholder="authorization name" required> ' +
+      '<input name="description" placeholder="description"> ' +
+      '<button>Add authorization</button>' +
+    '</form>' +
+    '<div id="sa-auth-list">loading\u2026</div>' +
+    '<h2 style="margin-top:24px">Data store</h2>' +
+    '<p>Select an authorization and use the buttons below to encrypt,' +
+    ' fetch, list and delete records.</p>' +
+    '<select id="sa-data-auth"><option value="">(choose auth)</option></select> ' +
+    '<input id="sa-data-label" placeholder="label"> ' +
+    '<input id="sa-data-plaintext" placeholder="plaintext"> ' +
+    '<button id="sa-data-put">Encrypt &amp; store</button> ' +
+    '<input id="sa-data-id" placeholder="record id"> ' +
+    '<button id="sa-data-get">Fetch &amp; decrypt</button> ' +
+    '<button id="sa-data-del">Delete</button> ' +
+    '<button id="sa-data-list">List</button>' +
+    '<pre id="sa-data-out"></pre>';
+  document.body.appendChild(container);
+
+  var list = container.querySelector("#sa-auth-list");
+  var addForm = container.querySelector("#sa-auth-add");
+  var dataAuth = container.querySelector("#sa-data-auth");
+  var dataOut = container.querySelector("#sa-data-out");
+
+  addForm.addEventListener("submit", async function (e) {
+    e.preventDefault();
+    var fd = new FormData(addForm);
+    try {
+      await sa.addAuthorization({
+        name: fd.get("name"), description: fd.get("description")
+      });
+      addForm.reset();
+      refresh();
+    } catch (err) { alert("Add failed: " + err.message); }
+  });
+
+  async function refresh() {
+    list.innerHTML = "loading\u2026";
+    try {
+      var res = await sa.getAuthorizations();
+      var auths = res.authorizations || [];
+      list.innerHTML = "";
+      dataAuth.innerHTML = '<option value="">(choose auth)</option>';
+
+      var table = document.createElement("table");
+      table.border = "1";
+      table.style.borderCollapse = "collapse";
+      table.innerHTML = "<thead><tr><th>ID</th><th>Name</th>" +
+        "<th>Description</th><th>Actions</th></tr></thead>";
+      var tbody = document.createElement("tbody");
+      for (var i = 0; i < auths.length; i++) {
+        (function (a) {
+          var tr = document.createElement("tr");
+          var td1 = document.createElement("td"); td1.textContent = a.id;
+          var td2 = document.createElement("td"); td2.textContent = a.name;
+          var td3 = document.createElement("td"); td3.textContent = a.description || "";
+          var td4 = document.createElement("td");
+
+          var shareBtn = document.createElement("button");
+          shareBtn.textContent = "Share";
+          shareBtn.addEventListener("click", async function () {
+            var target = prompt("Share with which username?");
+            if (!target) return;
+            try { await sa.shareAuthorizationMasterkey(a.id, target); alert("Shared"); }
+            catch (err) { alert("Share failed: " + err.message); }
+          });
+          td4.appendChild(shareBtn);
+
+          var bootBtn = document.createElement("button");
+          bootBtn.textContent = "Bootstrap all";
+          bootBtn.style.marginLeft = "4px";
+          bootBtn.addEventListener("click", async function () {
+            try { await sa.bootstrapAuthorizationKeys(a.id); alert("Bootstrapped"); }
+            catch (err) { alert("Bootstrap failed: " + err.message); }
+          });
+          td4.appendChild(bootBtn);
+
+          var delBtn = document.createElement("button");
+          delBtn.textContent = "Delete";
+          delBtn.style.marginLeft = "4px";
+          delBtn.addEventListener("click", async function () {
+            if (!confirm("Delete authorization " + a.name + "?")) return;
+            try { await sa.deleteAuthorization(a.id); refresh(); }
+            catch (err) { alert("Delete failed: " + err.message); }
+          });
+          td4.appendChild(delBtn);
+
+          tr.appendChild(td1); tr.appendChild(td2);
+          tr.appendChild(td3); tr.appendChild(td4);
+          tbody.appendChild(tr);
+
+          var opt = document.createElement("option");
+          opt.value = a.id;
+          opt.textContent = a.name + " (" + a.id + ")";
+          dataAuth.appendChild(opt);
+        })(auths[i]);
+      }
+      table.appendChild(tbody);
+      list.appendChild(table);
+    } catch (err) {
+      list.textContent = "Error: " + err.message;
+    }
+  }
+
+  container.querySelector("#sa-data-put").addEventListener("click", async function () {
+    var authId = dataAuth.value;
+    var pt = container.querySelector("#sa-data-plaintext").value;
+    var label = container.querySelector("#sa-data-label").value;
+    if (!authId) { alert("pick an authorization"); return; }
+    try {
+      var r = await sa.encryptAndStore(authId, pt, { label: label });
+      dataOut.textContent = "stored id=" + r.id;
+      container.querySelector("#sa-data-id").value = r.id;
+    } catch (err) { dataOut.textContent = "Error: " + err.message; }
+  });
+
+  container.querySelector("#sa-data-get").addEventListener("click", async function () {
+    var id = container.querySelector("#sa-data-id").value;
+    if (!id) return;
+    try { dataOut.textContent = await sa.fetchAndDecrypt(id); }
+    catch (err) { dataOut.textContent = "Error: " + err.message; }
+  });
+
+  container.querySelector("#sa-data-del").addEventListener("click", async function () {
+    var id = container.querySelector("#sa-data-id").value;
+    if (!id) return;
+    try { await sa.deleteData(id); dataOut.textContent = "deleted " + id; }
+    catch (err) { dataOut.textContent = "Error: " + err.message; }
+  });
+
+  container.querySelector("#sa-data-list").addEventListener("click", async function () {
+    var authId = dataAuth.value;
+    if (!authId) return;
+    try {
+      var r = await sa.listData(authId);
+      dataOut.textContent = JSON.stringify(r, null, 2);
+    } catch (err) { dataOut.textContent = "Error: " + err.message; }
+  });
+
+  refresh();
+})();
+`
+
+var pageScripts = map[string]string{
+	"/login":          loginPageScript,
+	"/users":          usersPageScript,
+	"/roles":          rolesPageScript,
+	"/authorizations": authsPageScript,
+}
+
+func (sa *SecureAuth) handleServeSecureAuthJS(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/javascript; charset=utf-8")
 	_, _ = io.WriteString(w, secureAuthJS)
+}
+
+func (sa *SecureAuth) handleServeOpaqueJS(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/javascript; charset=utf-8")
+	_, _ = io.WriteString(w, opaqueJS)
 }
 
 // ---------------------------------------------------------------------------
@@ -1895,9 +3710,340 @@ func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
-func boolToInt(b bool) int {
-	if b {
-		return 1
+// ---------------------------------------------------------------------------
+// Built-in default templates
+// ---------------------------------------------------------------------------
+
+const defaultCSS = `
+:root {
+  --sa-bg: #f6f8fa;
+  --sa-surface: #ffffff;
+  --sa-surface-2: #f6f8fa;
+  --sa-border: #d0d7de;
+  --sa-border-muted: #eaeef2;
+  --sa-fg: #1f2328;
+  --sa-fg-muted: #59636e;
+  --sa-accent: #0969da;
+  --sa-accent-hover: #0550ae;
+  --sa-danger: #cf222e;
+  --sa-radius: 8px;
+  --sa-radius-lg: 12px;
+  --sa-shadow: 0 4px 16px rgba(31, 35, 40, .08);
+}
+*, *::before, *::after { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; }
+body {
+  margin: 0;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans",
+    Helvetica, Arial, sans-serif, "Apple Color Emoji", "Segoe UI Emoji";
+  font-size: 15px;
+  line-height: 1.55;
+  color: var(--sa-fg);
+  background: var(--sa-bg);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+a { color: var(--sa-accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+h1, h2, h3 {
+  font-weight: 600;
+  line-height: 1.25;
+  margin: 0 0 6px;
+  letter-spacing: -.01em;
+}
+h1 { font-size: 24px; }
+h2 { font-size: 18px; }
+h3 { font-size: 15px; }
+p { margin: 0 0 12px; }
+.sa-muted { color: var(--sa-fg-muted); }
+
+body > nav {
+  display: flex;
+  align-items: center;
+  font-size: 0;
+  padding: 10px 24px;
+  background: var(--sa-surface);
+  border-bottom: 1px solid var(--sa-border);
+  position: sticky;
+  top: 0;
+  z-index: 10;
+}
+body > nav > a,
+body > nav > button {
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--sa-fg);
+  padding: 6px 12px;
+  border-radius: 6px;
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+  text-decoration: none;
+  line-height: 1.4;
+  font-family: inherit;
+}
+body > nav > a:hover,
+body > nav > button:hover {
+  background: var(--sa-bg);
+  color: var(--sa-accent);
+  text-decoration: none;
+}
+body > nav > button {
+  margin-left: auto;
+  border: 1px solid var(--sa-border);
+  background: var(--sa-surface);
+}
+body > nav > button:hover {
+  border-color: var(--sa-accent);
+  color: var(--sa-accent);
+}
+
+.sa-container,
+body > div:not([class]) {
+  max-width: 1080px;
+  margin: 0 auto;
+  padding: 32px 24px 64px;
+}
+.sa-page-head { margin-bottom: 24px; }
+.sa-page-head h1 { margin: 0 0 4px; }
+.sa-page-head p { margin: 0; color: var(--sa-fg-muted); }
+
+form { margin: 0 0 20px; }
+input, select, textarea {
+  font: inherit;
+  color: var(--sa-fg);
+  background: var(--sa-surface);
+  border: 1px solid var(--sa-border);
+  border-radius: var(--sa-radius);
+  padding: 8px 12px;
+  margin: 0 8px 8px 0;
+  transition: border-color .15s, box-shadow .15s;
+  outline: none;
+  vertical-align: middle;
+}
+input:focus, select:focus, textarea:focus {
+  border-color: var(--sa-accent);
+  box-shadow: 0 0 0 3px rgba(9, 105, 218, .15);
+}
+input::placeholder { color: #8c959f; }
+
+button {
+  font: inherit;
+  font-weight: 500;
+  color: var(--sa-fg);
+  background: var(--sa-surface);
+  border: 1px solid var(--sa-border);
+  border-radius: var(--sa-radius);
+  padding: 7px 14px;
+  margin: 0 6px 8px 0;
+  cursor: pointer;
+  transition: background .12s, border-color .12s, color .12s;
+  vertical-align: middle;
+  line-height: 1.4;
+}
+button:hover { background: var(--sa-bg); border-color: #afb8c1; }
+button:active { transform: translateY(1px); }
+form button[type="submit"] {
+  background: var(--sa-accent);
+  border-color: var(--sa-accent);
+  color: #fff;
+}
+form button[type="submit"]:hover {
+  background: var(--sa-accent-hover);
+  border-color: var(--sa-accent-hover);
+}
+
+table {
+  border-collapse: separate !important;
+  border-spacing: 0 !important;
+  width: 100%;
+  margin: 8px 0 20px;
+  background: var(--sa-surface);
+  border: 1px solid var(--sa-border);
+  border-radius: var(--sa-radius-lg);
+  overflow: hidden;
+  font-size: 14px;
+}
+table thead th {
+  text-align: left;
+  background: var(--sa-surface-2);
+  color: var(--sa-fg-muted);
+  font-weight: 600;
+  font-size: 12px;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--sa-border);
+}
+table tbody td {
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--sa-border-muted);
+  vertical-align: middle;
+}
+table tbody tr:last-child td { border-bottom: 0; }
+table tbody tr:hover { background: var(--sa-surface-2); }
+
+pre, .sa-status {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas,
+    "Liberation Mono", monospace;
+  font-size: 13px;
+  color: var(--sa-fg-muted);
+  margin: 8px 0 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+body.sa-auth-body {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background:
+    radial-gradient(1200px 600px at 50% -250px, #dbeafe 0%, rgba(219, 234, 254, 0) 55%),
+    var(--sa-bg);
+}
+.sa-auth-card {
+  width: 100%;
+  max-width: 380px;
+  background: var(--sa-surface);
+  border: 1px solid var(--sa-border);
+  border-radius: var(--sa-radius-lg);
+  box-shadow: var(--sa-shadow);
+  padding: 32px 28px 28px;
+}
+.sa-auth-brand {
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: .1em;
+  text-transform: uppercase;
+  color: var(--sa-accent);
+  margin-bottom: 16px;
+}
+.sa-auth-card h1 { font-size: 22px; margin: 0 0 6px; }
+.sa-auth-card .sa-muted { margin: 0 0 22px; }
+.sa-field { display: block; margin-bottom: 14px; }
+.sa-field > .sa-label {
+  display: block;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--sa-fg);
+  margin-bottom: 6px;
+}
+.sa-field input {
+  display: block;
+  width: 100%;
+  margin: 0;
+}
+.sa-auth-card form { margin: 0; }
+.sa-auth-card form button[type="submit"] {
+  display: block;
+  width: 100%;
+  padding: 10px 14px;
+  margin: 18px 0 0;
+  font-size: 15px;
+}
+.sa-auth-foot {
+  margin-top: 18px;
+  font-size: 12px;
+  text-align: center;
+  color: var(--sa-fg-muted);
+}
+`
+
+const defaultLoginHTML = `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sign in · SecureAuth</title>
+<style>` + defaultCSS + `</style>
+</head>
+<body class="sa-auth-body">
+<main class="sa-auth-card">
+  <div class="sa-auth-brand">SecureAuth</div>
+  <h1>Sign in</h1>
+  <p class="sa-muted">Enter your credentials to continue.</p>
+  <form id="f">
+    <label class="sa-field">
+      <span class="sa-label">Username</span>
+      <input name="username" autocomplete="username" required>
+    </label>
+    <label class="sa-field">
+      <span class="sa-label">Password</span>
+      <input name="password" type="password" autocomplete="current-password" required>
+    </label>
+    <button type="submit">Sign in</button>
+  </form>
+  <pre id="out" class="sa-status"></pre>
+  <div class="sa-auth-foot">Protected with OPAQUE · End-to-end encrypted</div>
+</main>
+{loginjs}
+</body>
+</html>`
+
+const defaultUsersHTML = `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Users · SecureAuth</title>
+<style>` + defaultCSS + `</style>
+</head>
+<body>
+<main class="sa-container">
+  <div class="sa-page-head">
+    <h1>Users</h1>
+    <p>Create, update and remove user accounts and their roles.</p>
+  </div>
+  <div id="out"></div>
+</main>
+{usersjs}
+</body>
+</html>`
+
+const defaultRolesHTML = `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Roles · SecureAuth</title>
+<style>` + defaultCSS + `</style>
+</head>
+<body>
+{rolesjs}
+</body>
+</html>`
+
+const defaultAuthorizationsHTML = `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Authorizations · SecureAuth</title>
+<style>` + defaultCSS + `</style>
+</head>
+<body>
+{authorizationsjs}
+</body>
+</html>`
+
+// installDefaultTemplates wires up the built-in fallback pages. It is called
+// from Init so that a host application can use SecureAuth without calling
+// any Set*PageTemplate method. Hosts that do call them will simply override
+// the defaults.
+func (sa *SecureAuth) installDefaultTemplates() error {
+	if err := sa.SetLoginPageTemplate(defaultLoginHTML); err != nil {
+		return err
 	}
-	return 0
+	if err := sa.SetUsersPageTemplate(defaultUsersHTML); err != nil {
+		return err
+	}
+	if err := sa.SetRolesPageTemplate(defaultRolesHTML); err != nil {
+		return err
+	}
+	if err := sa.SetAuthorizationsPageTemplate(defaultAuthorizationsHTML); err != nil {
+		return err
+	}
+	return nil
 }
