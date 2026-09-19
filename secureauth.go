@@ -1906,22 +1906,26 @@ func (sa *SecureAuth) handleLogout(w http.ResponseWriter, r *http.Request) {
 // User management
 // ---------------------------------------------------------------------------
 
+// createUserRequest accepts either a single legacy `role` string or a
+// `roles` array. If both are present, `roles` wins and `role` is ignored.
+// At least one role must be supplied.
 type createUserRequest struct {
-	Username               string `json:"username"`
-	Role                   string `json:"role"`
-	PendingRegID           string `json:"pendingRegId"`
-	RegistrationRecord     string `json:"registration_record"`
-	RSAPublicKey           string `json:"rsa_public_key"`
-	EncryptedRSAPrivateKey string `json:"encrypted_rsa_private_key"`
-	PrivateKeyNonce        string `json:"private_key_nonce"`
-	PrivateKeySalt         string `json:"private_key_salt"`
-	PrivateKeyKDFInfo      string `json:"private_key_kdf_info"`
-	RSASigningPublicKey    string `json:"rsa_signing_public_key"`
-	EncryptedRSASigningKey string `json:"encrypted_rsa_signing_private_key"`
-	SigningKeyNonce        string `json:"signing_key_nonce"`
-	SigningKeySalt         string `json:"signing_key_salt"`
-	SigningKeyKDFInfo      string `json:"signing_key_kdf_info"`
-	KSFSalt                string `json:"ksf_salt"`
+	Username               string   `json:"username"`
+	Role                   string   `json:"role,omitempty"`
+	Roles                  []string `json:"roles,omitempty"`
+	PendingRegID           string   `json:"pendingRegId"`
+	RegistrationRecord     string   `json:"registration_record"`
+	RSAPublicKey           string   `json:"rsa_public_key"`
+	EncryptedRSAPrivateKey string   `json:"encrypted_rsa_private_key"`
+	PrivateKeyNonce        string   `json:"private_key_nonce"`
+	PrivateKeySalt         string   `json:"private_key_salt"`
+	PrivateKeyKDFInfo      string   `json:"private_key_kdf_info"`
+	RSASigningPublicKey    string   `json:"rsa_signing_public_key"`
+	EncryptedRSASigningKey string   `json:"encrypted_rsa_signing_private_key"`
+	SigningKeyNonce        string   `json:"signing_key_nonce"`
+	SigningKeySalt         string   `json:"signing_key_salt"`
+	SigningKeyKDFInfo      string   `json:"signing_key_kdf_info"`
+	KSFSalt                string   `json:"ksf_salt"`
 }
 
 func (sa *SecureAuth) handleCreateUser(w http.ResponseWriter, r *http.Request) {
@@ -1936,6 +1940,17 @@ func (sa *SecureAuth) handleCreateUser(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := validateUsername(req.Username); err != nil {
 		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+
+	// Resolve the effective role set. Prefer the new `roles` array; fall
+	// back to the legacy single `role` string for backward compatibility.
+	roleNames := req.Roles
+	if len(roleNames) == 0 && req.Role != "" {
+		roleNames = []string{req.Role}
+	}
+	if len(roleNames) == 0 {
+		http.Error(w, "bad request: at least one role required", http.StatusBadRequest)
 		return
 	}
 
@@ -2017,11 +2032,13 @@ func (sa *SecureAuth) handleCreateUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	roleID := "role-" + req.Role
-	_, _ = tx.Exec(
-		`INSERT OR IGNORE INTO `+tblUserRoles+` (user_id, role_id) VALUES (?, ?)`,
-		req.Username, roleID,
-	)
+	for _, roleName := range roleNames {
+		roleID := "role-" + roleName
+		_, _ = tx.Exec(
+			`INSERT OR IGNORE INTO `+tblUserRoles+` (user_id, role_id) VALUES (?, ?)`,
+			req.Username, roleID,
+		)
+	}
 
 	if err := revokeStaleSharedKeysTx(tx, now); err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
@@ -2135,22 +2152,27 @@ func (sa *SecureAuth) handleGetUsers(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]interface{}{"users": users})
 }
 
-// updateUserRequest intentionally has no NewUsername field: renaming a user
-// would invalidate the OPAQUE envelope (bound to the client identity), so the
-// library forbids it. Unknown JSON fields (including newUsername) are ignored
-// by encoding/json.
+// updateUserRequest accepts either a legacy single `newRole` string or a
+// `newRoles` array. If both are present, `newRoles` wins and `newRole` is
+// ignored. An empty (or absent) role field means "leave roles unchanged".
+//
+// It intentionally has no NewUsername field: renaming a user would
+// invalidate the OPAQUE envelope (bound to the client identity), so the
+// library forbids it. Unknown JSON fields (including newUsername) are
+// ignored by encoding/json.
 type updateUserRequest struct {
-	UserID                 string `json:"userId"`
-	NewRole                string `json:"newRole,omitempty"`
-	PendingRegID           string `json:"pendingRegId,omitempty"`
-	RegistrationRecord     string `json:"registration_record,omitempty"`
-	EncryptedRSAPrivateKey string `json:"encrypted_rsa_private_key,omitempty"`
-	PrivateKeyNonce        string `json:"private_key_nonce,omitempty"`
-	PrivateKeySalt         string `json:"private_key_salt,omitempty"`
-	EncryptedRSASigningKey string `json:"encrypted_rsa_signing_private_key,omitempty"`
-	SigningKeyNonce        string `json:"signing_key_nonce,omitempty"`
-	SigningKeySalt         string `json:"signing_key_salt,omitempty"`
-	KSFSalt                string `json:"ksf_salt,omitempty"`
+	UserID                 string   `json:"userId"`
+	NewRole                string   `json:"newRole,omitempty"`
+	NewRoles               []string `json:"newRoles,omitempty"`
+	PendingRegID           string   `json:"pendingRegId,omitempty"`
+	RegistrationRecord     string   `json:"registration_record,omitempty"`
+	EncryptedRSAPrivateKey string   `json:"encrypted_rsa_private_key,omitempty"`
+	PrivateKeyNonce        string   `json:"private_key_nonce,omitempty"`
+	PrivateKeySalt         string   `json:"private_key_salt,omitempty"`
+	EncryptedRSASigningKey string   `json:"encrypted_rsa_signing_private_key,omitempty"`
+	SigningKeyNonce        string   `json:"signing_key_nonce,omitempty"`
+	SigningKeySalt         string   `json:"signing_key_salt,omitempty"`
+	KSFSalt                string   `json:"ksf_salt,omitempty"`
 }
 
 func (sa *SecureAuth) handleUpdateUser(w http.ResponseWriter, r *http.Request) {
@@ -2241,13 +2263,22 @@ func (sa *SecureAuth) handleUpdateUser(w http.ResponseWriter, r *http.Request) {
 		_ = credID
 	}
 
-	if req.NewRole != "" {
+	// Resolve the effective role set. Prefer the new `newRoles` array;
+	// fall back to the legacy single `newRole` string. An empty result
+	// means "leave roles unchanged".
+	roleNames := req.NewRoles
+	if len(roleNames) == 0 && req.NewRole != "" {
+		roleNames = []string{req.NewRole}
+	}
+	if len(roleNames) > 0 {
 		_, _ = tx.Exec(`DELETE FROM `+tblUserRoles+` WHERE user_id = ?`, req.UserID)
-		roleID := "role-" + req.NewRole
-		_, _ = tx.Exec(
-			`INSERT OR IGNORE INTO `+tblUserRoles+` (user_id, role_id) VALUES (?, ?)`,
-			req.UserID, roleID,
-		)
+		for _, roleName := range roleNames {
+			roleID := "role-" + roleName
+			_, _ = tx.Exec(
+				`INSERT OR IGNORE INTO `+tblUserRoles+` (user_id, role_id) VALUES (?, ?)`,
+				req.UserID, roleID,
+			)
+		}
 	}
 
 	if err := revokeStaleSharedKeysTx(tx, now); err != nil {
@@ -3322,6 +3353,10 @@ const loginPageScript = `
 })();
 `
 
+// usersPageScript now supports multi-role selection on both create and edit.
+// The wrapper createUserMulti works around the underlying single-role
+// SecureAuth.createUser by creating the user with the first role and then
+// immediately calling updateUser with the full set.
 const usersPageScript = sharedShellScript + `
 (function () {
   var sa = window.SecureAuth;
@@ -3332,22 +3367,38 @@ const usersPageScript = sharedShellScript + `
   }
   root.innerHTML = "";
 
+  // Multi-role wrapper around the single-role SecureAuth.createUser.
+  var _origCreate = sa.createUser.bind(sa);
+  async function createUserMulti(username, password, roles) {
+    if (!Array.isArray(roles)) roles = [roles];
+    roles = roles.filter(function (r) { return !!r; });
+    if (roles.length === 0) throw new Error("at least one role required");
+    await _origCreate(username, password, roles[0]);
+    if (roles.length > 1) {
+      await sa.updateUser(username, { newRoles: roles });
+    }
+  }
+
   // --- create user ---
   var createForm = document.createElement("form");
   createForm.innerHTML =
     '<h3>Create user</h3>' +
     '<input name="username" placeholder="username" required> ' +
     '<input name="password" type="password" placeholder="password" required> ' +
-    '<select name="role">' +
-      '<option>Viewer</option><option>Manager</option>' +
-      '<option>Admin</option><option>SuperAdmin</option>' +
-    '</select> ' +
+    '<fieldset><legend>Roles</legend>' +
+      '<label><input type="checkbox" name="roles" value="Viewer"> Viewer</label> ' +
+      '<label><input type="checkbox" name="roles" value="Manager"> Manager</label> ' +
+      '<label><input type="checkbox" name="roles" value="Admin"> Admin</label> ' +
+      '<label><input type="checkbox" name="roles" value="SuperAdmin"> SuperAdmin</label>' +
+    '</fieldset> ' +
     '<button>Create</button>';
   createForm.addEventListener("submit", async function (e) {
     e.preventDefault();
     var fd = new FormData(createForm);
+    var roles = fd.getAll("roles");
+    if (roles.length === 0) { alert("Pick at least one role"); return; }
     try {
-      await sa.createUser(fd.get("username"), fd.get("password"), fd.get("role"));
+      await createUserMulti(fd.get("username"), fd.get("password"), roles);
       createForm.reset();
       refresh();
     } catch (err) {
@@ -3424,21 +3475,32 @@ const usersPageScript = sharedShellScript + `
     h.textContent = "Edit " + u.username;
     editPanel.appendChild(h);
 
+    var currentRoles = (u.roles || []).slice();
+    function checked(role) {
+      return currentRoles.indexOf(role) >= 0 ? " checked" : "";
+    }
+
     var form = document.createElement("form");
     form.innerHTML =
-      '<label>New role: <select name="newRole">' +
-        '<option value="">(unchanged)</option>' +
-        '<option>Viewer</option><option>Manager</option>' +
-        '<option>Admin</option><option>SuperAdmin</option>' +
-      '</select></label> ' +
+      '<fieldset><legend>Roles</legend>' +
+        '<label><input type="checkbox" name="newRoles" value="Viewer"' + checked("Viewer") + '> Viewer</label> ' +
+        '<label><input type="checkbox" name="newRoles" value="Manager"' + checked("Manager") + '> Manager</label> ' +
+        '<label><input type="checkbox" name="newRoles" value="Admin"' + checked("Admin") + '> Admin</label> ' +
+        '<label><input type="checkbox" name="newRoles" value="SuperAdmin"' + checked("SuperAdmin") + '> SuperAdmin</label>' +
+      '</fieldset> ' +
       '<label>New password: <input name="password" type="password" placeholder="(unchanged)"></label> ' +
       '<button>Save</button> <button type="button" id="sa-cancel">Cancel</button>';
     form.addEventListener("submit", async function (e) {
       e.preventDefault();
       var fd = new FormData(form);
       var changes = {};
-      var nr = fd.get("newRole");
-      if (nr) changes.newRole = nr;
+      var newRoles = fd.getAll("newRoles");
+      var rolesChanged = newRoles.length !== currentRoles.length ||
+        newRoles.some(function (r) { return currentRoles.indexOf(r) < 0; });
+      if (rolesChanged) {
+        if (newRoles.length === 0) { alert("Pick at least one role"); return; }
+        changes.newRoles = newRoles;
+      }
       var np = fd.get("password");
       if (np) changes.password = np;
       if (Object.keys(changes).length === 0) { editPanel.innerHTML = ""; return; }
