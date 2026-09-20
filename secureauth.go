@@ -942,6 +942,54 @@ func (sa *SecureAuth) addBootstrapMasterkeyTx(tx *sql.Tx, authID string) error {
 }
 
 // ---------------------------------------------------------------------------
+// Host-application integration helpers
+//
+// These functions are exposed so a host application built on top of
+// SecureAuth can perform the same checks and emit the same audit entries as
+// SecureAuth's own handlers, without needing access to the private API.
+// ---------------------------------------------------------------------------
+
+// AppendAudit appends one entry to the tamper-evident audit chain. Exposed
+// so host applications can log their own mutations into the same hash chain
+// as SecureAuth's built-in operations (see VerifyAuditChain).
+//
+// (action, resource, result, details) are free-form; SecureAuth itself uses
+// action ∈ {"authorize", "login2", "user.create", ...} and result ∈
+// {"allow", "deny"}. Hosts should follow the same convention.
+func (sa *SecureAuth) AppendAudit(userID, action, resource, result, ip, details string) {
+	sa.appendAudit(userID, action, resource, result, ip, details)
+}
+
+// UserHasPermission reports whether userID currently holds the named
+// authorization, without requiring an *http.Request. Role-based only; see
+// UserHasAuthorization for the role-or-shared-key variant.
+func (sa *SecureAuth) UserHasPermission(userID, permission string) (bool, error) {
+	return sa.userHasPermission(userID, permission)
+}
+
+// AuthorizationNameByID resolves an authorization ID to its name. Returns
+// sql.ErrNoRows when the ID is unknown.
+func (sa *SecureAuth) AuthorizationNameByID(authID string) (string, error) {
+	return sa.authorizationName(authID)
+}
+
+// UserExists reports whether a username is registered. Used by hosts to
+// validate share targets before storing wrapped keys for them.
+func (sa *SecureAuth) UserExists(username string) (bool, error) {
+	var one int
+	err := sa.db.QueryRow(
+		`SELECT 1 FROM `+tblUsers+` WHERE username = ?`, username,
+	).Scan(&one)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// ---------------------------------------------------------------------------
 // HTTP plumbing
 // ---------------------------------------------------------------------------
 
@@ -1039,7 +1087,7 @@ func setSecurityHeaders(w http.ResponseWriter, r *http.Request) *http.Request {
 	h.Set("Referrer-Policy", "no-referrer")
 	h.Set("Content-Security-Policy", fmt.Sprintf(
 		"default-src 'none'; "+
-			"script-src 'nonce-%s' 'wasm-unsafe-eval' https://cdn.jsdelivr.net; "+
+			"script-src 'nonce-%s' 'self' 'wasm-unsafe-eval' https://cdn.jsdelivr.net; "+
 			"style-src 'self' 'unsafe-inline'; "+
 			"connect-src 'self' https://cdn.jsdelivr.net; "+
 			"img-src 'self'; "+
@@ -1359,7 +1407,23 @@ func (sa *SecureAuth) UserHasAuthorization(r *http.Request, authorizationName st
 	if err != nil {
 		return false, err
 	}
-	return sa.userHasPermission(sess.UserID, authorizationName)
+	if ok, err := sa.userHasPermission(sess.UserID, authorizationName); err != nil {
+		return false, err
+	} else if ok {
+		return true, nil
+	}
+	var authID string
+	err = sa.db.QueryRow(
+		`SELECT id FROM `+tblAuthorizations+` WHERE name = ?`,
+		authorizationName,
+	).Scan(&authID)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return sa.userHasActiveKey(sess.UserID, authID), nil
 }
 
 func (sa *SecureAuth) userHasPermission(userID, permission string) (bool, error) {
@@ -3267,6 +3331,29 @@ func (sa *SecureAuth) handleIndex(w http.ResponseWriter, r *http.Request) {
 
 	importMap := `<script type="importmap" nonce="` + nonce + `">` + importMapJSON() + `</script>`
 
+	// Inline guard for the login page: this is a classic (non-module) script,
+	// so it runs synchronously at parse time and does not depend on the
+	// module graph loading successfully. It unconditionally cancels the
+	// first submission of the login form, so that if the real handler in
+	// the module script ever fails to attach (blocked import, CDN outage,
+	// extension interference, JS exception during module init, ...), the
+	// browser still cannot fall back to a native form submission that would
+	// put the password in the URL bar. When the module script does load, its
+	// own submit handler runs after this one and performs the actual login.
+	guardScript := ""
+	if page == "/login" || page == "/" {
+		guardScript = `<script nonce="` + nonce + `">` +
+			`(function(){` +
+			`var f=document.querySelector("form#f");if(!f)return;` +
+			`f.addEventListener("submit",function(e){` +
+			`e.preventDefault();` +
+			`var o=document.querySelector("#out");` +
+			`if(o&&!o.textContent)o.textContent="Loading\u2026 please wait";` +
+			`});` +
+			`})();` +
+			`</script>`
+	}
+
 	// Boot: import the module and start init(). Expose the resulting promise
 	// on window.__sa_ready so the per-page script can await it.
 	bootScript := `<script type="module" nonce="` + nonce + `">` +
@@ -3282,7 +3369,7 @@ func (sa *SecureAuth) handleIndex(w http.ResponseWriter, r *http.Request) {
 			`await window.__sa_ready; ` + body + `</script>`
 	}
 
-	injection := importMap + bootScript + pageScript
+	injection := importMap + guardScript + bootScript + pageScript
 
 	var buf strings.Builder
 	if err := t.Execute(&buf, nil); err != nil {
@@ -4026,7 +4113,7 @@ const defaultLoginHTML = `<!doctype html>
   <div class="sa-auth-brand">SecureAuth</div>
   <h1>Sign in</h1>
   <p class="sa-muted">Enter your credentials to continue.</p>
-  <form id="f">
+  <form id="f" method="post" action="/login">
     <label class="sa-field">
       <span class="sa-label">Username</span>
       <input name="username" autocomplete="username" required>
