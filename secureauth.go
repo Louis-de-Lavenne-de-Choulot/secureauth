@@ -56,6 +56,7 @@ type InitOptions struct {
 	BootstrapToken string
 	TLSCertificate []byte
 	TrustedProxies []string
+	Debug          bool
 }
 
 type SecureAuth struct {
@@ -66,6 +67,7 @@ type SecureAuth struct {
 	opaqueServer   *opaque.Server
 	tlsEndPoint    []byte
 	bootstrapToken []byte
+	debug          bool
 
 	trustedProxies []*net.IPNet
 
@@ -75,8 +77,9 @@ type SecureAuth struct {
 	auditMu     sync.Mutex
 	bootstrapMu sync.Mutex
 
-	sessionTTL      time.Duration
-	loginAttemptTTL time.Duration
+	sessionTTL          time.Duration
+	loginAttemptTTL     time.Duration
+	loginReturnEndpoint string
 }
 
 const maxBodyBytes = 256 * 1024
@@ -109,7 +112,7 @@ func Init(dbdriver string, dsn string, opts InitOptions) (*SecureAuth, error) {
 	if len(opts.MasterKey) != 32 {
 		return nil, errors.New("secureauth: MasterKey must be exactly 32 bytes")
 	}
-	if len(opts.TLSCertificate) == 0 {
+	if len(opts.TLSCertificate) == 0 && !opts.Debug {
 		return nil, errors.New("secureauth: TLSCertificate is required for channel binding")
 	}
 
@@ -126,6 +129,7 @@ func Init(dbdriver string, dsn string, opts InitOptions) (*SecureAuth, error) {
 		sessionTTL:      30 * time.Minute,
 		loginAttemptTTL: 2 * time.Minute,
 		rl:              newRateLimiter(),
+		debug:           opts.Debug,
 	}
 	sa.masterKey = make([]byte, 32)
 	copy(sa.masterKey, opts.MasterKey)
@@ -144,8 +148,20 @@ func Init(dbdriver string, dsn string, opts InitOptions) (*SecureAuth, error) {
 		sa.trustedProxies = append(sa.trustedProxies, netw)
 	}
 
-	h := sha256.Sum256(opts.TLSCertificate)
-	sa.tlsEndPoint = h[:]
+	switch {
+	case len(opts.TLSCertificate) > 0:
+		h := sha256.Sum256(opts.TLSCertificate)
+		sa.tlsEndPoint = h[:]
+	case opts.Debug:
+		// Debug mode with no cert: derive a fixed, well-known channel-binding
+		// value so client and server agree on the transcript input. This value
+		// MUST NOT be used outside debug — it provides no binding.
+		h := sha256.Sum256([]byte("secureauth:debug:no-channel-binding:v1"))
+		sa.tlsEndPoint = h[:]
+		log.Printf("secureauth: DEBUG — no TLS certificate, using fixed channel binding")
+	default:
+		return nil, errors.New("secureauth: TLSCertificate is required for channel binding")
+	}
 
 	if opts.BootstrapToken == "" {
 		opts.BootstrapToken = base64.RawURLEncoding.EncodeToString(randomBytes(24))
@@ -1050,12 +1066,9 @@ func (sa *SecureAuth) wrap(next http.HandlerFunc, needsCSRF bool) http.HandlerFu
 			http.Error(w, "HTTPS required", http.StatusForbidden)
 			return
 		}
-		r = setSecurityHeaders(w, r)
+		r = sa.setSecurityHeaders(w, r) // ← was setSecurityHeaders(w, r)
 
 		if needsCSRF && sessionIDFromRequest(r) != "" {
-			// Only enforce CSRF if the session actually exists server-side.
-			// A stale cookie (session expired/deleted) must not be able to
-			// 403 requests that would otherwise be valid.
 			if _, err := sa.loadSessionInfo(r); err == nil {
 				if err := sa.verifyCSRF(r); err != nil {
 					http.Error(w, "CSRF check failed", http.StatusForbidden)
@@ -1076,12 +1089,14 @@ func requireTLS(r *http.Request) error {
 
 type cspNonceKey struct{}
 
-func setSecurityHeaders(w http.ResponseWriter, r *http.Request) *http.Request {
+func (sa *SecureAuth) setSecurityHeaders(w http.ResponseWriter, r *http.Request) *http.Request {
 	nonce := hex.EncodeToString(randomBytes(16))
 	r = r.WithContext(context.WithValue(r.Context(), cspNonceKey{}, nonce))
 
 	h := w.Header()
-	h.Set("Strict-Transport-Security", "max-age=63072000; includeSubDomains; preload")
+	if !sa.debug {
+		h.Set("Strict-Transport-Security", "max-age=63072000; includeSubDomains; preload")
+	}
 	h.Set("X-Frame-Options", "DENY")
 	h.Set("X-Content-Type-Options", "nosniff")
 	h.Set("Referrer-Policy", "no-referrer")
@@ -1315,7 +1330,7 @@ func (sa *SecureAuth) loadSession(next func(http.ResponseWriter, *http.Request, 
 	return func(w http.ResponseWriter, r *http.Request) {
 		sess, err := sa.loadSessionInfo(r)
 		if err != nil {
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			http.Error(w, "unauthorized: "+err.Error(), http.StatusUnauthorized)
 			return
 		}
 		next(w, r, sess)
@@ -1882,12 +1897,12 @@ func (sa *SecureAuth) handleLogin2(w http.ResponseWriter, r *http.Request) {
 
 	http.SetCookie(w, &http.Cookie{
 		Name: "secureauth_session", Value: sessionID, Path: "/",
-		Secure: true, HttpOnly: true, SameSite: http.SameSiteStrictMode,
+		Secure: true, HttpOnly: true, SameSite: http.SameSiteLaxMode,
 		Expires: expiresAt,
 	})
 	http.SetCookie(w, &http.Cookie{
 		Name: "secureauth_csrf", Value: csrfCookie, Path: "/",
-		Secure: true, HttpOnly: false, SameSite: http.SameSiteStrictMode,
+		Secure: true, HttpOnly: false, SameSite: http.SameSiteLaxMode,
 		Expires: expiresAt,
 	})
 
@@ -1957,11 +1972,11 @@ func (sa *SecureAuth) handleLogout(w http.ResponseWriter, r *http.Request) {
 	}
 	http.SetCookie(w, &http.Cookie{
 		Name: "secureauth_session", Value: "", Path: "/", MaxAge: -1,
-		Secure: true, HttpOnly: true, SameSite: http.SameSiteStrictMode,
+		Secure: true, HttpOnly: true, SameSite: http.SameSiteLaxMode,
 	})
 	http.SetCookie(w, &http.Cookie{
 		Name: "secureauth_csrf", Value: "", Path: "/", MaxAge: -1,
-		Secure: true, HttpOnly: true, SameSite: http.SameSiteStrictMode,
+		Secure: true, HttpOnly: false, SameSite: http.SameSiteLaxMode,
 	})
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
@@ -2518,8 +2533,18 @@ func (sa *SecureAuth) handleGetWrappedMasterkey(w http.ResponseWriter, r *http.R
 		http.Error(w, "authorization not found", http.StatusNotFound)
 		return
 	}
-	hasAuth, err := sa.userHasPermission(sess.UserID, authName)
-	if err != nil || !hasAuth {
+
+	// Accept role permission OR an active shared key. The per-resource
+	// authorizations created by the host application (auth-client-*,
+	// auth-fiche-*) are never linked to any role — the shared key itself
+	// is the grant. Requiring role permission would lock every normal
+	// user out of their own content.
+	roleOK, err := sa.userHasPermission(sess.UserID, authName)
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	if !roleOK && !sa.userHasActiveKey(sess.UserID, req.AuthorizationID) {
 		sa.appendAudit(sess.UserID, "masterkey.get", req.AuthorizationID,
 			"deny", sa.clientIP(r), "lacks authorization")
 		http.Error(w, "forbidden", http.StatusForbidden)
@@ -3256,6 +3281,10 @@ func validateTemplate(kind, tpl string) error {
 	return nil
 }
 
+func (sa *SecureAuth) SetLoginReturnEndpoint(endpoint string) {
+	sa.loginReturnEndpoint = endpoint
+}
+
 func (sa *SecureAuth) SetLoginPageTemplate(tpl string) error {
 	if err := validateTemplate("login", tpl); err != nil {
 		return err
@@ -3365,8 +3394,10 @@ func (sa *SecureAuth) handleIndex(w http.ResponseWriter, r *http.Request) {
 
 	pageScript := ""
 	if body, ok := pageScripts[page]; ok && body != "" {
-		pageScript = `<script type="module" nonce="` + nonce + `">` +
-			`await window.__sa_ready; ` + body + `</script>`
+		pageScript = `<script type="module" nonce="` + nonce + `">` + body + `</script>`
+		if page == "/login" || page == "/" {
+			pageScript = strings.Replace(pageScript, "{loginReturnEndpoint}", sa.loginReturnEndpoint, 1)
+		}
 	}
 
 	injection := importMap + guardScript + bootScript + pageScript
@@ -3418,7 +3449,7 @@ const sharedShellScript = `
 })();
 `
 
-const loginPageScript = `
+var loginPageScript = `
 (function () {
   var form = document.querySelector("form#f");
   var out = document.querySelector("#out");
@@ -3428,10 +3459,11 @@ const loginPageScript = `
     var fd = new FormData(form);
     out.textContent = "Signing in\u2026";
     try {
+      if (window.__sa_ready) await window.__sa_ready;
       await window.SecureAuth.login(fd.get("username"), fd.get("password"));
       sessionStorage.setItem("secureauth_logged_in", "1");
       out.textContent = "Signed in. Redirecting\u2026";
-      setTimeout(function () { location.href = "/users"; }, 200);
+      setTimeout(function () { location.href = "{loginReturnEndpoint}"; }, 200);
     } catch (err) {
       console.error(err);
       out.textContent = "Login failed: " + err.message;

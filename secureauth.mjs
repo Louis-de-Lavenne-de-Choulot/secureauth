@@ -94,14 +94,49 @@ export function concat(...arrays) {
   return out;
 }
 
-export function b64encode(bytes) {
+export function b64encode(x) {
+  // Accept Uint8Array, ArrayBuffer, DataView, any ArrayBufferView,
+  // Array<number>, and strings. WebCrypto returns ArrayBuffer from
+  // subtle.sign / encrypt / decrypt / digest, and ArrayBuffer has no
+  // Symbol.iterator — the source of "bytes is not iterable".
+  let bytes;
+  if (x instanceof Uint8Array) {
+    bytes = x;
+  } else if (x instanceof ArrayBuffer) {
+    bytes = new Uint8Array(x);
+  } else if (ArrayBuffer.isView(x)) {
+    bytes = new Uint8Array(x.buffer, x.byteOffset, x.byteLength);
+  } else if (Array.isArray(x)) {
+    bytes = Uint8Array.from(x);
+  } else if (typeof x === "string") {
+    bytes = new TextEncoder().encode(x);
+  } else if (x && typeof x.length === "number") {
+    bytes = Uint8Array.from(x);
+  } else {
+    throw new TypeError(
+      "b64encode: expected bytes-like input, got " +
+        Object.prototype.toString.call(x),
+    );
+  }
+
   let s = "";
-  for (const b of bytes) s += String.fromCharCode(b);
+  const chunk = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunk) {
+    s += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+  }
   return btoa(s);
 }
 
-export function b64decode(str) {
-  const bin = atob(str);
+export function b64decode(x) {
+  if (x instanceof Uint8Array) return x;
+  if (x instanceof ArrayBuffer) return new Uint8Array(x);
+  if (ArrayBuffer.isView(x)) {
+    return new Uint8Array(x.buffer, x.byteOffset, x.byteLength);
+  }
+  if (typeof x !== "string") {
+    throw new TypeError("b64decode: expected base64 string");
+  }
+  const bin = atob(x);
   const out = new Uint8Array(bin.length);
   for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
   return out;
