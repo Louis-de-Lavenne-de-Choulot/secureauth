@@ -1,3 +1,4 @@
+```markdown
 # SecureAuth
 
 An OPAQUE-based authentication and authorization library for Go web applications. Passwords never leave the browser in a form the server can read, sessions are end-to-end encrypted, and per-authorization masterkeys are wrapped under each user's RSA key.
@@ -33,6 +34,7 @@ This README documents only the **public API**. Internal packages, database table
 4. [Roles and permissions model](#roles-and-permissions-model)
 5. [First-run bootstrap](#first-run-bootstrap)
 6. [Error handling](#error-handling)
+7. [Deployment behind a reverse proxy](#deployment-behind-a-reverse-proxy)
 
 ---
 
@@ -163,14 +165,14 @@ Registers all SecureAuth HTTP routes on `mux` and returns it. Call this once fro
 | `/api/data/get` | POST | session | Retrieves an encrypted record. |
 | `/api/data/delete` | POST | session | Deletes an encrypted record. |
 | `/api/data/list` | POST | session | Lists records for an authorization. |
-| `/api/bootstrap/credentials` | GET | — | Returns first-run admin credentials (only while uninitialized). |
+| `/api/bootstrap/credentials` | GET | — | Returns first-run admin credentials (only while uninitialized, and only to loopback callers). |
 | `/api/bootstrap/masterkeys-pending` | GET | session | Returns pending masterkeys for the first admin. |
 | `/api/bootstrap/first-user` | POST | session | Commits the first admin's wrapped masterkeys. |
 | `/static/secureauth.mjs` | GET | — | Serves the browser client. |
 | `/static/opaque.mjs` | GET | — | Serves the OPAQUE browser implementation. |
 | `/`, `/login`, `/users`, `/roles`, `/authorizations` | GET | — | Serves the built-in HTML pages. |
 
-The handler returned by `SecureAuthAndCommHandler` **must be served over HTTPS** — every route rejects plain HTTP with `403`.
+The handler returned by `SecureAuthAndCommHandler` **must be served over HTTPS** — every route rejects plain HTTP with `403`. It is designed to sit behind a TLS-terminating reverse proxy in production — see [Deployment behind a reverse proxy](#deployment-behind-a-reverse-proxy).
 
 ### `SecureAuth` methods
 
@@ -677,9 +679,13 @@ You can also set `SECUREAUTH_ADMIN_USERNAME` and `SECUREAUTH_ADMIN_PASSWORD` env
 
 The browser client automates the rest: on the first page load against an uninitialized server, `SecureAuth.init()` fetches `/api/bootstrap/credentials`, creates the first admin, logs in as that admin, wraps every pending masterkey under the admin's RSA public key, and commits them. After the first admin exists, `/api/bootstrap/credentials` returns `{ available: false }` and the bootstrap path is inert.
 
+**Loopback restriction:** `/api/bootstrap/credentials` only returns the admin password to callers whose source IP is **loopback**. Requests from a non-loopback source (including requests forwarded by a reverse proxy that adds `X-Forwarded-For`) receive `{ available: false }`. This is a deliberate race-condition guard: on a fresh deployment, without it, anyone who reached the server before the legitimate operator could win the first login and provision their own SuperAdmin account.
+
+Behind a reverse proxy, this means the automatic bootstrap will not fire in a normal browser session. Two workarounds — an SSH tunnel, or a dedicated Nginx `location` block that strips `X-Forwarded-For` for just this endpoint — are documented in [Deployment behind a reverse proxy](#deployment-behind-a-reverse-proxy).
+
 **Programmatic bootstrap alternative:** if you would rather not rely on the browser flow, register everything you need from Go (`RegisterAuthorization`, `RegisterRole`) before serving traffic, then create the first admin explicitly. The `RegisterAuthorization` call ensures the sealed bootstrap payload contains a masterkey for every declared authorization, so the first admin's browser client only needs to fetch `/api/bootstrap/masterkeys-pending` and commit once.
 
-**Operational note:** until the first user is created, `/api/bootstrap/credentials` returns the admin password and bootstrap token to any unauthenticated caller. Never expose the server before a trusted admin has completed the first login. If your deployment model cannot guarantee that, set `SECUREAUTH_ADMIN_USERNAME` and `SECUREAUTH_ADMIN_PASSWORD` and complete the first login out of band.
+**Operational note:** until the first user is created, `/api/bootstrap/credentials` returns the admin password and bootstrap token to any **loopback** caller. Never expose the server on a public interface before a trusted admin has completed the first login. If your deployment model cannot guarantee that, set `SECUREAUTH_ADMIN_USERNAME` and `SECUREAUTH_ADMIN_PASSWORD` and complete the first login out of band.
 
 ---
 
@@ -723,3 +729,250 @@ Rate limits are applied per source IP (or per username for login attempts) and a
 - **Login finish**: 10 per IP and 5 per username, 1 refill per minute.
 
 If you run behind a proxy, list its CIDRs in `TrustedProxies` so the client IP is extracted correctly.
+
+---
+
+## Deployment behind a reverse proxy
+
+The intended production topology is:
+
+```
+Internet ──► Nginx (TLS on :443) ──► SecureAuth app (HTTPS on 127.0.0.1:8443)
+```
+
+Nginx terminates TLS with a publicly trusted certificate (e.g. Let's Encrypt), forwards the request to the Go process over loopback, and the Go process serves the pages and API. Session cookies are `Secure; HttpOnly; SameSite=Lax` and are only ever sent over the outer TLS connection, so the loopback hop does not degrade security.
+
+### Reverse proxy requirements
+
+Your proxy config must forward at minimum:
+
+| Header | Purpose |
+|---|---|
+| `Host` | Preserves the `Origin` header checks and the OPAQUE transcript. |
+| `X-Forwarded-Proto: https` | SecureAuth's `wrap()` middleware rejects requests without this header if `r.TLS == nil`. |
+| `X-Forwarded-For` | Populates the audit log and rate limiter with the real client IP. |
+| `X-Real-IP` | Same; used by some deployment tooling. |
+
+If your proxy adds other headers (e.g. Cloudflare's `CF-Connecting-IP`, `True-Client-IP`), make sure they do **not** shadow `X-Forwarded-For` with something the library will not recognise.
+
+### `TrustedProxies` and client-IP extraction
+
+SecureAuth's `ClientIP()` helper decides whether to trust `X-Forwarded-For` based on the immediate peer address:
+
+1. Parse `r.RemoteAddr`.
+2. If the peer matches a CIDR in `TrustedProxies`, honour `X-Forwarded-For`.
+3. If `TrustedProxies` is empty, trust only loopback and RFC 1918 addresses.
+4. Otherwise, fall back to `r.RemoteAddr`.
+
+For a single-host deployment with Nginx on `127.0.0.1`, the default behaviour is correct and no configuration is required. For a proxy on a different host (or a container network), add its range:
+
+```go
+secureauth.InitOptions{
+    // ...
+    TrustedProxies: []string{
+        "10.0.0.0/8",     // private network where the proxy lives
+        "172.16.0.0/12",
+        "192.168.0.0/16",
+    },
+}
+```
+
+**Do not** trust ranges you do not control. A malicious `X-Forwarded-For` from an untrusted peer would let an attacker spoof their audit-log identity and poison the rate limiter.
+
+### The bootstrap endpoint loopback check
+
+`/api/bootstrap/credentials` is the **only** endpoint in the library that inspects the source IP for a security decision. It returns the first-admin credentials to **loopback callers only**, and `{ available: false }` to everyone else. This is intentional: on a fresh deployment, without it, anyone who reaches the server before the legitimate operator could win the first login and provision their own SuperAdmin account.
+
+When Nginx is in front of the app, the peer is `127.0.0.1` (trusted), so `X-Forwarded-For` is honoured, and the effective client IP becomes the browser's public address. The loopback check fails, the automatic bootstrap never fires, and you will see nothing happen in the browser console — the login page loads, `/api/login/init` succeeds, but `/api/bootstrap/credentials` returns `{ available: false }` so no admin is auto-provisioned.
+
+Two ways to reconcile this with a public deployment:
+
+#### Option A — SSH tunnel (recommended, safest)
+
+Leave Nginx in place for normal traffic and bootstrap the first admin through a direct loopback connection:
+
+```bash
+# On your workstation
+ssh -N -L 8443:127.0.0.1:8443 user@your-server
+```
+
+Leave the terminal open, then open `https://127.0.0.1:8443/login` in your browser. Accept the self-signed cert warning (this is the app's own cert, unchanged, and only visible to you over the tunnel). The request reaches the Go process directly, `X-Forwarded-For` is absent, the loopback check passes, and the automatic bootstrap completes. Watch the console:
+
+```
+secureauth: performing first-admin bootstrap...
+secureauth: first-admin bootstrap complete.
+```
+
+Close the tunnel afterwards. `/api/bootstrap/credentials` will now permanently return `{ available: false }`, and the endpoint is inert.
+
+#### Option B — Strip `X-Forwarded-For` on the bootstrap endpoint only
+
+Add a dedicated `location` block **before** the catch-all `location /`. Nginx runs on the same host as the app, so if you clear the client-IP headers, the app sees `r.RemoteAddr == "127.0.0.1"` and the loopback check passes:
+
+```nginx
+location = /api/bootstrap/credentials {
+    proxy_pass https://127.0.0.1:8443;
+    proxy_ssl_verify off;
+    proxy_ssl_server_name on;
+    proxy_http_version 1.1;
+    proxy_set_header Host              $host;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    # Deliberately clear the client-IP headers so the Go app sees the
+    # request as originating from loopback. Without this, the
+    # /api/bootstrap/credentials loopback check fails and the automatic
+    # first-admin bootstrap never runs.
+    proxy_set_header X-Forwarded-For   "";
+    proxy_set_header X-Real-IP         "";
+}
+```
+
+**Trade-off:** during the bootstrap window — the short interval between the first `systemctl start` and your first successful admin login — anyone who knows the URL can read the first-admin credentials. In practice the window is minutes. Complete the bootstrap immediately and the endpoint returns `{ available: false }` forever, at which point the bypass is inert. If that window is unacceptable, use Option A.
+
+### Full Nginx configuration
+
+The block below assumes:
+
+- Your app listens on `https://127.0.0.1:8443` with a self-signed cert (the default in `EXAMPLE_SERVER.MD`).
+- Nginx is on the same host.
+- `myapp.example.com` is your public hostname and its A record points at this server.
+- Ports 80 and 443 are open in your firewall/security group.
+
+```nginx
+# /etc/nginx/sites-available/myapp
+
+# ── HTTP: ACME + redirect ────────────────────────────────────────────────
+server {
+    listen 80;
+    server_name myapp.example.com;
+
+    location /.well-known/acme-challenge/ {
+        root /var/www/html;
+    }
+
+    location / {
+        return 301 https://$host$request_uri;
+    }
+}
+
+# ── HTTPS ────────────────────────────────────────────────────────────────
+server {
+    listen 443 ssl;
+    server_name myapp.example.com;
+
+    ssl_certificate     /etc/letsencrypt/live/myapp.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/myapp.example.com/privkey.pem;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_ciphers         HIGH:!aNULL:!MD5;
+    ssl_session_cache   shared:SSL:10m;
+    ssl_session_timeout 10m;
+
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+    add_header X-Frame-Options DENY always;
+    add_header X-Content-Type-Options nosniff always;
+    add_header Referrer-Policy strict-origin-when-cross-origin always;
+
+    # Upstream talks to the Go app over HTTPS with a self-signed cert.
+    # Turn off verification — the loopback hop is trusted.
+    proxy_ssl_verify       off;
+    proxy_ssl_server_name  on;
+
+    proxy_http_version 1.1;
+
+    proxy_set_header Host              $host;
+    proxy_set_header X-Real-IP         $remote_addr;
+    proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+
+    # WebSocket-safe timeouts (the encrypted relay used by collaborative
+    # pages can idle for a while). Bump these if you have very long
+    # sessions.
+    proxy_read_timeout 600s;
+    proxy_send_timeout 600s;
+
+    # Attachments and encrypted data blobs can be large.
+    client_max_body_size 2G;
+
+    # ── Bootstrap-credentials bypass (Option B) ──────────────────────────
+    # Strip the client-IP headers so the Go app sees the request as
+    # originating from loopback. Delete this block if you bootstrap via
+    # SSH tunnel (Option A) or complete bootstrap out of band.
+    location = /api/bootstrap/credentials {
+        proxy_pass https://127.0.0.1:8443;
+        proxy_ssl_verify off;
+        proxy_ssl_server_name on;
+        proxy_http_version 1.1;
+        proxy_set_header Host              $host;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-For   "";
+        proxy_set_header X-Real-IP         "";
+    }
+
+    location / {
+        proxy_pass https://127.0.0.1:8443;
+    }
+}
+```
+
+Enable the site and reload:
+
+```bash
+sudo ln -sf /etc/nginx/sites-available/myapp /etc/nginx/sites-enabled/myapp
+sudo nginx -t
+sudo systemctl reload nginx
+```
+
+### Verifying the deployment
+
+From the server:
+
+```bash
+# The app is listening on loopback?
+sudo ss -tlnp | grep :8443
+
+# Nginx can proxy to it?
+curl -kI https://myapp.example.com/ --resolve myapp.example.com:443:127.0.0.1
+
+# The bootstrap endpoint returns credentials from the server's own perspective
+# (this is a loopback call, so it always works and always returns the real
+#  value while the record is unconsumed):
+curl -k https://myapp.example.com/api/bootstrap/credentials \
+     --resolve myapp.example.com:443:127.0.0.1
+```
+
+From your workstation:
+
+```bash
+# DNS resolves to your public IP?
+dig +short myapp.example.com
+
+# Port 443 is reachable?
+nc -vz myapp.example.com 443
+```
+
+### Troubleshooting
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| Browser redirects to a different site | Another Nginx server block has `default_server` on 443, or your site's symlink is missing. | `ls -la /etc/nginx/sites-enabled/`; ensure your block is enabled and has the right `server_name`. |
+| `/api/login/init` returns `403` | `X-Forwarded-Proto` is missing or set to `http`. | Ensure the proxy passes `X-Forwarded-Proto $scheme` and that the outer request is HTTPS. |
+| Login fails with `envelope: auth tag mismatch` | The password does not match the stored OPAQUE envelope, **or** the DB was reset since the credentials were captured. | Retrieve the current credentials from the app log, log in immediately, and do not wipe the DB afterwards. |
+| Automatic bootstrap never fires | The reverse proxy forwards `X-Forwarded-For`, so the loopback check on `/api/bootstrap/credentials` fails. | Use Option A or Option B above. |
+| WebSocket (`/api/.../ws`) closes immediately | `Upgrade` / `Connection` headers are not forwarded, or the CSP blocks the connection. | Add `proxy_set_header Upgrade $http_upgrade; proxy_set_header Connection "upgrade";` to the catch-all location. |
+| Attachments time out | Default `proxy_read_timeout` (60s) is too short. | Raise it as in the config above (600s). |
+
+### Certificate rotation
+
+SecureAuth binds the SHA-256 of the TLS certificate into the session key derivation. That means **every active session becomes invalid when the certificate changes** — the library detects the mismatch and rejects the session, forcing a fresh login. This is by design and happens at most once per Let's Encrypt renewal cycle (every 60 days if you use `--webroot` with certbot's default). Users see a login prompt and lose nothing.
+
+If you need to keep sessions alive across a certificate rotation, terminate TLS at the proxy with a long-lived certificate (e.g. an internal CA you control) and treat the proxy-to-app hop as the source of truth. The library's `TLSCertificate` option accepts any DER/PEM certificate, not just the one Nginx presents to the world.
+
+### Auditing and rate limiting behind a proxy
+
+The audit log records the client IP that `ClientIP()` resolves. For accurate entries:
+
+- Ensure your proxy forwards `X-Forwarded-For`.
+- Add the proxy's CIDR to `TrustedProxies` if it is not on loopback.
+- Never trust `X-Forwarded-For` from an address range you do not control.
+
+The rate limiter uses the same resolved IP. If you see unusually permissive limits in production (many successful logins from one address), it usually means `TrustedProxies` is misconfigured and everyone is being counted as the proxy's IP.
+```

@@ -1,3 +1,4 @@
+````markdown
 ```go
 module github.com/you/myapp
 
@@ -88,6 +89,15 @@ func main() {
 			MasterKey:      masterKey,
 			ServerID:       "secureauth",
 			TLSCertificate: certDER,
+
+			// TrustedProxies controls which peers are allowed to set the
+			// X-Forwarded-For header that the library uses for client-IP
+			// extraction (audit log and rate limiter). When running behind
+			// Nginx on the same host, "127.0.0.1/32" and "::1/128" are
+			// already trusted by default; you only need to add ranges here
+			// if your reverse proxy is on a different machine.
+			//
+			// TrustedProxies: []string{"10.0.0.0/8", "172.16.0.0/12"},
 		})
 	must(err)
 
@@ -102,16 +112,13 @@ func main() {
 
 	mux := http.NewServeMux()
 
-	// secureauth.go, inside SecureAuthAndCommHandler, before the "/" catch-all
-
 	mux.HandleFunc("/favicon.ico", func(w http.ResponseWriter, r *http.Request) {
-		// Serve a minimal 1×1 transparent ICO so browsers stop 404-ing.
-		// The bytes below are a valid 16×16 transparent favicon.
+		// Serve a minimal 1x1 transparent ICO so browsers stop 404-ing.
 		ico := "\x00\x00\x01\x00\x01\x00\x10\x10\x00\x00\x01\x00\x20\x00\x68\x04" +
 			"\x00\x00\x16\x00\x00\x00\x28\x00\x00\x00\x10\x00\x00\x00\x20\x00" +
 			"\x00\x00\x01\x00\x20\x00\x00\x00\x00\x00\x40\x04\x00\x00\x00\x00" +
 			"\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00" +
-			string(make([]byte, 0x440)) // transparent BGRA pixels
+			string(make([]byte, 0x440))
 		w.Header().Set("Content-Type", "image/x-icon")
 		w.Header().Set("Cache-Control", "public, max-age=86400")
 		_, _ = io.WriteString(w, ico)
@@ -146,7 +153,7 @@ func loadOrGenMasterKey() []byte {
 	_, err := rand.Read(k)
 	must(err)
 	must(os.WriteFile(path, []byte(hex.EncodeToString(k)+"\n"), 0o600))
-	log.Printf("generated %s — back this up, it decrypts all sessions", path)
+	log.Printf("generated %s - back this up, it decrypts all sessions", path)
 	return k
 }
 
@@ -242,7 +249,7 @@ var loginHTML = fmt.Sprintf(`<!doctype html>
 var usersHTML = fmt.Sprintf(`<!doctype html>
 <html><head><meta charset="utf-8"><title>Users</title></head>
 <body>
-<h1>Users</h1><pre id="out">Open devtools — call SecureAuth.getUsers() from the console.</pre>
+<h1>Users</h1><pre id="out">Open devtools - call SecureAuth.getUsers() from the console.</pre>
 %s
 </body></html>`, "{usersjs}")
 
@@ -254,3 +261,60 @@ var authsHTML = fmt.Sprintf(`<!doctype html>
 <html><head><meta charset="utf-8"><title>Authorizations</title></head>
 <body><h1>Authorizations</h1>%s</body></html>`, "{authorizationsjs}")
 ```
+
+---
+
+## Running behind a reverse proxy
+
+The example above binds to `localhost:8443` and serves HTTPS directly. That is fine for local development, but in production you almost always want a real reverse proxy on port 443 that terminates TLS with a valid certificate. **Nginx on the same host is the recommended setup.**
+
+### Why the bootstrap endpoint needs special handling
+
+`/api/bootstrap/credentials` is the only endpoint in the library that deliberately restricts *who* can read it, based on the **source IP address** of the HTTP request. It only discloses the first-admin credentials to loopback callers. This is intentional — see the "First-run bootstrap" section of the README — and exists so that an attacker who reaches your server before you do cannot race you for the first login.
+
+When Nginx is in front of the app, every request arrives from `127.0.0.1` (Nginx itself), but Nginx also adds an `X-Forwarded-For` header carrying the *browser's* real IP. The library's `ClientIP()` helper trusts `X-Forwarded-For` from loopback peers, so the effective client IP becomes the browser's public address, and the loopback check fails.
+
+Result: the login page loads, `/api/login/init` works, but the automatic first-admin bootstrap never fires because `/api/bootstrap/credentials` returns `{"available":false}`.
+
+### Fixing it — two options
+
+#### Option A — SSH tunnel (safest)
+
+Leave Nginx in place for normal traffic, but bootstrap the first admin through a direct loopback connection. On your workstation:
+
+```bash
+ssh -N -L 8443:127.0.0.1:8443 user@your-server
+```
+
+Leave that terminal open, then open `https://127.0.0.1:8443/login` in your browser. Accept the self-signed cert warning (that is the app's own cert, unchanged). The request reaches the Go process directly, `X-Forwarded-For` is absent, the loopback check passes, and the bootstrap completes. Close the tunnel afterwards; `/api/bootstrap/credentials` will permanently return `{"available":false}` once the record is consumed.
+
+#### Option B — Strip `X-Forwarded-For` on the bootstrap endpoint only
+
+Add a dedicated `location` block ahead of `location /`. Nginx runs on the same host as the app, so if you clear the client-IP headers the app sees `r.RemoteAddr == "127.0.0.1"` and the loopback check passes.
+
+```nginx
+# Nginx server block for myapp.example.com
+# Full config in the README, section 7.
+
+location = /api/bootstrap/credentials {
+    proxy_pass https://127.0.0.1:8443;
+    proxy_ssl_verify off;
+    proxy_ssl_server_name on;
+    proxy_http_version 1.1;
+    proxy_set_header Host              $host;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    # Deliberately clear the client-IP headers so the Go app sees the
+    # request as originating from loopback. Without this, the
+    # /api/bootstrap/credentials loopback check fails and the automatic
+    # first-admin bootstrap never runs.
+    proxy_set_header X-Forwarded-For   "";
+    proxy_set_header X-Real-IP         "";
+}
+```
+
+**Trade-off:** while the bootstrap record is unconsumed, anyone who knows the URL can read the first-admin credentials during that window. In practice the window is the few minutes between first `systemctl start` and your first successful login. Complete the bootstrap immediately and it becomes inert. If that window is unacceptable for your threat model, use Option A.
+
+### Full Nginx configuration
+
+See section **7. Deployment behind a reverse proxy** in the README for the complete server block, including WebSocket-safe timeouts, HSTS, and the ACME challenge path.
+````
