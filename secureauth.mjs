@@ -2,19 +2,6 @@
 //
 // OPAQUE protocol is delegated to ./opaque.mjs (byte-compatible with
 // github.com/bytemare/opaque, ristretto255-SHA512 / SHA-512 / Argon2id).
-//
-// This file contains ONLY the SecureAuth client surface:
-//   * HTTP plumbing & CSRF
-//   * RSA-OAEP / RSA-PSS key handling
-//   * X25519 + HKDF-SHA256 session-key derivation
-//   * XChaCha20-Poly1305 encrypted data store
-//   * bootstrap / user / role / authorization management
-//
-// It also re-exports a small set of low-level primitives (b64 helpers,
-// randomBytes, concat, hkdfSha256, hmacSha256, jsonFetch, RSA wrap/sign
-// helpers, getCsrfToken) so downstream applications can build their own
-// layers on top of SecureAuth without re-implementing cryptography or
-// HTTP plumbing. Nothing application-specific lives in this file.
 
 import { xchacha20poly1305 } from "@noble/ciphers/chacha.js";
 import { x25519 } from "@noble/curves/ed25519.js";
@@ -61,23 +48,45 @@ const state = {
   initPromise: null,
   bootstrapInProgress: false,
   masterkeyCache: {},
+  // Short-lived reauth token; cleared on logout.
+  reauthToken: null,
 };
+
+// Module-scope, non-exported slot for the non-extractable HKDF CryptoKey
+// derived from the OPAQUE export key during a TOTP-pending login. This is
+// deliberately NOT on `state`, so it is not reachable via `window.SecureAuth`
+// or via any exported accessor. The raw export-key bytes are zeroised
+// immediately after import.
+let pendingExportKeyCryptoKey = null;
 
 // ===========================================================================
 // Primitive helpers (exported for downstream applications)
 // ===========================================================================
 
-// Loads and imports the RSA-OAEP + RSA-PSS keys from /api/privatekey.
-// `exportKey` is the OPAQUE export key that unlocks the encrypted PKCS#8
-// blobs; it is not zeroised here — the caller owns its lifetime.
-async function loadAndImportPrivateKeys(exportKey) {
+// hkdfSha256BytesFromCryptoKey uses the WebCrypto HKDF primitive to derive
+// `length` bytes from a non-extractable HKDF CryptoKey. This is what lets us
+// avoid ever holding the raw export-key bytes longer than necessary.
+async function hkdfSha256BytesFromCryptoKey(cryptoKey, salt, info, length) {
+  const bits = await crypto.subtle.deriveBits(
+    { name: "HKDF", hash: "SHA-256", salt, info },
+    cryptoKey,
+    length * 8,
+  );
+  return new Uint8Array(bits);
+}
+
+// loadAndImportPrivateKeys imports the RSA-OAEP + RSA-PSS private keys. The
+// caller passes a `derive(salt, info, length) -> Promise<Uint8Array>` function
+// so this works both from a raw export key and from a non-extractable HKDF
+// CryptoKey.
+async function loadAndImportPrivateKeys(deriveFn) {
   const blob = await jsonFetch("/api/privatekey");
 
   const salt = b64decode(blob.private_key_salt);
   const nonce = b64decode(blob.private_key_nonce);
   const ciphertext = b64decode(blob.encrypted_rsa_private_key);
   const info = utf8(blob.private_key_kdf_info || "SecureAuth RSA private key");
-  const kPriv = hkdfSha256(exportKey, salt, info, 32);
+  const kPriv = await deriveFn(salt, info, 32);
   const plaintextPriv = xchacha20poly1305(kPriv, nonce).decrypt(ciphertext);
 
   state.rsaPrivateKeyPkcs8 = new Uint8Array(plaintextPriv);
@@ -98,7 +107,7 @@ async function loadAndImportPrivateKeys(exportKey) {
     const sInfo = utf8(
       blob.signing_key_kdf_info || "SecureAuth RSA signing private key",
     );
-    kSign = hkdfSha256(exportKey, sSalt, sInfo, 32);
+    kSign = await deriveFn(sSalt, sInfo, 32);
     sPlain = xchacha20poly1305(kSign, sNonce).decrypt(sCt);
 
     state.rsaSigningKeyPkcs8 = new Uint8Array(sPlain);
@@ -130,15 +139,16 @@ async function loadAndImportPrivateKeys(exportKey) {
   zeroise(kPriv, plaintextPriv, kSign, sPlain);
 }
 
+// completePendingTotpLogin uses the non-extractable HKDF CryptoKey that was
+// stashed during login() to derive the per-user RSA decryption keys and
+// import them as CryptoKeys. Never stores the raw export-key bytes.
 async function completePendingTotpLogin() {
-  const exportKey = state.pendingExportKey;
-  if (!exportKey) return;
-  state.pendingExportKey = null;
-  try {
-    await loadAndImportPrivateKeys(exportKey);
-  } finally {
-    zeroise(exportKey);
-  }
+  const cryptoKey = pendingExportKeyCryptoKey;
+  if (!cryptoKey) return;
+  pendingExportKeyCryptoKey = null;
+  await loadAndImportPrivateKeys((salt, info, length) =>
+    hkdfSha256BytesFromCryptoKey(cryptoKey, salt, info, length),
+  );
 }
 
 export function assertSecureContext() {
@@ -169,10 +179,6 @@ export function concat(...arrays) {
 }
 
 export function b64encode(x) {
-  // Accept Uint8Array, ArrayBuffer, DataView, any ArrayBufferView,
-  // Array<number>, and strings. WebCrypto returns ArrayBuffer from
-  // subtle.sign / encrypt / decrypt / digest, and ArrayBuffer has no
-  // Symbol.iterator — the source of "bytes is not iterable".
   let bytes;
   if (x instanceof Uint8Array) {
     bytes = x;
@@ -245,9 +251,6 @@ export async function hmacSha256(keyBytes, msgBytes) {
   return new Uint8Array(await crypto.subtle.sign("HMAC", key, msgBytes));
 }
 
-// jsonFetch: GET when body is undefined, POST otherwise. JSON in, JSON out.
-// `__csrf: false` in the body suppresses the CSRF header (used by /logout
-// and by the pre-session bootstrap path). `__method` overrides the method.
 export async function jsonFetch(path, body) {
   const headers = {};
   const csrf = getCsrfToken();
@@ -330,11 +333,6 @@ async function opaqueFinishLog(
 
 // ===========================================================================
 // RSA helpers
-//
-// The unwrap/sign helpers now take the CryptoKey explicitly so they can be
-// used outside the SecureAuth session lifecycle. Downstream code that needs
-// the session keys can obtain them via SecureAuth.currentRsaPrivateKey() /
-// SecureAuth.currentRsaSigningKey().
 // ===========================================================================
 
 export async function rsaWrapMasterkey(masterkeyBytes, rsaPublicKeyDer) {
@@ -363,9 +361,6 @@ export async function rsaUnwrapMasterkey(wrappedBytes, rsaPrivateKey) {
   );
 }
 
-// WebCrypto hashes the input internally with SHA-256 before applying PSS.
-// The Go server does sha256.Sum256(wrapped) then rsa.VerifyPSS, so we must
-// pass the raw bytes here, not a pre-computed digest.
 export async function rsaSignWrapped(wrappedBytes, rsaSigningKey) {
   if (!rsaSigningKey) {
     throw new Error("SecureAuth: no RSA signing key provided");
@@ -491,7 +486,17 @@ export const SecureAuth = {
     state.bootstrapInProgress = true;
     try {
       await this.createUser(bUser, bPass, "SuperAdmin");
-      await this.login(bUser, bPass);
+
+      const loginRes = await this.login(bUser, bPass);
+      if (loginRes && loginRes.totpRequired) {
+        throw new Error(
+          "SecureAuth: bootstrap login is TOTP-pending but bootstrap " +
+            "cannot complete TOTP setup interactively. The server's " +
+            "finishLogin2 should have exempted the bootstrap admin " +
+            "from the TOTP gate while the bootstrap record is " +
+            "unconsumed; verify code.",
+        );
+      }
 
       const pendingRes = await fetch("/api/bootstrap/masterkeys-pending", {
         credentials: "same-origin",
@@ -505,6 +510,12 @@ export const SecureAuth = {
       const spkiDer = await this.ownRsaPublicKeyDer();
       const wrappedKeys = [];
       const signKey = state.rsaSigningKey;
+      if (!signKey) {
+        throw new Error(
+          "SecureAuth: bootstrap is missing the RSA signing key — " +
+            "login did not load the per-user key material.",
+        );
+      }
       for (const [authId, mkB64] of Object.entries(masterkeys || {})) {
         const masterkey = b64decode(mkB64);
         const wrapped = await rsaWrapMasterkey(masterkey, spkiDer);
@@ -611,11 +622,21 @@ export const SecureAuth = {
     state.userID = username;
 
     if (step2.totpRequired) {
-      // Server marked this session totp_pending. /api/privatekey would 403.
-      // Keep the OPAQUE export key around so we can decrypt the RSA blobs
-      // after the user completes the second factor.
-      state.pendingExportKey = exportKey; // NOT zeroised — it's now owned by state
-      zeroise(sessionKey, clientEphPriv, macKey);
+      // Import the export key as a *non-extractable* HKDF CryptoKey, then
+      // zeroise the raw bytes. The CryptoKey can be used with WebCrypto's
+      // HKDF to derive the per-user RSA decryption key after TOTP completes,
+      // but its raw bytes cannot be exfiltrated by JS.
+      try {
+        pendingExportKeyCryptoKey = await crypto.subtle.importKey(
+          "raw",
+          exportKey,
+          { name: "HKDF" },
+          false,
+          ["deriveBits", "deriveKey"],
+        );
+      } finally {
+        zeroise(exportKey, sessionKey, clientEphPriv, macKey);
+      }
       return {
         sessionId: state.sessionId,
         totpRequired: true,
@@ -623,7 +644,11 @@ export const SecureAuth = {
       };
     }
 
-    await loadAndImportPrivateKeys(exportKey);
+    // Normal login: derive the RSA decryption key directly from the raw
+    // export key, then zeroise everything.
+    await loadAndImportPrivateKeys((salt, info, length) =>
+      Promise.resolve(hkdfSha256(exportKey, salt, info, length)),
+    );
     zeroise(exportKey, sessionKey, clientEphPriv, macKey);
 
     return {
@@ -634,12 +659,79 @@ export const SecureAuth = {
   },
 
   // -------------------------------------------------------------------------
+  // reauth
+  //
+  // Completes a second OPAQUE handshake against /api/reauth/* to obtain a
+  // short-lived, single-use token that gates credential-changing operations
+  // on /api/updateuser. Callers who already have a recent reauth token can
+  // skip this step.
+  // -------------------------------------------------------------------------
+  async reauthenticate(password) {
+    assertSecureContext();
+    await this._ensureInit();
+
+    const clientState = newOpaqueState();
+    const ke1 = opaqueStartLog(clientState, password);
+
+    const initRes = await jsonFetch("/api/reauth/init", {
+      ke1: b64encode(ke1),
+    });
+    const { loginAttemptId, ke2, ksfSalt } = initRes;
+    const ke2Bytes = b64decode(ke2);
+    const ksfSaltBytes = b64decode(ksfSalt);
+
+    const { finishLoginRequest, sessionKey } = await opaqueFinishLog(
+      ke2Bytes,
+      clientState,
+      state.userID,
+      ksfSaltBytes,
+    );
+
+    const transcriptHash = sha256(concat(ke1, ke2Bytes));
+    const clientEphPriv = randomBytes(32);
+    const clientEphPub = x25519.getPublicKey(clientEphPriv);
+
+    const macKey = hkdfSha256(
+      sessionKey,
+      HKDF_SALT,
+      utf8("SecureAuth client MAC"),
+      32,
+    );
+    const clientMAC = await hmacSha256(macKey, clientEphPub);
+
+    const step2 = await jsonFetch("/api/reauth/finish", {
+      loginAttemptId,
+      ke3: b64encode(finishLoginRequest),
+      clientEphemeral: b64encode(clientEphPub),
+      clientMAC: b64encode(clientMAC),
+    });
+
+    zeroise(sessionKey, clientEphPriv, macKey);
+
+    if (!step2.reauthToken) {
+      throw new Error("SecureAuth: reauth token missing from response");
+    }
+    state.reauthToken = step2.reauthToken;
+    return step2.reauthToken;
+  },
+
+  // -------------------------------------------------------------------------
   // logout
   // -------------------------------------------------------------------------
   async logout() {
     try {
       await jsonFetch("/logout", { __csrf: false });
     } finally {
+      // Clear the init promise so the next login re-fetches server state
+      // and re-runs the bootstrap check. Needed for long-running SPAs that
+      // may see a bootstrap appear mid-session.
+      state.initPromise = null;
+      state.serverId = null;
+      state.tlsEndPoint = null;
+
+      // Drop the pending non-extractable HKDF key (if any).
+      pendingExportKeyCryptoKey = null;
+
       zeroise(state.pendingExportKey);
       state.pendingExportKey = null;
       zeroise(state.sessionKeyRaw);
@@ -652,6 +744,7 @@ export const SecureAuth = {
       state.rsaPrivateKeyPkcs8 = null;
       state.rsaSigningKeyPkcs8 = null;
       state.userID = null;
+      state.reauthToken = null;
       for (const k of Object.keys(state.masterkeyCache)) {
         if (state.masterkeyCache[k]?.fill) state.masterkeyCache[k].fill(0);
         delete state.masterkeyCache[k];
@@ -780,9 +873,24 @@ export const SecureAuth = {
   async getUsers() {
     return jsonFetch("/api/getusers", {});
   },
-  async updateUser(userId, changes) {
+
+  // updateUser — changes roles and/or credentials.
+  //
+  // When `changes.password` is set the caller MUST also supply either a
+  // cached reauth token (via a prior `reauthenticate`) or `opts.reauthPassword`
+  // so the server's X-Reauth-Token gate can be satisfied. This is what stops
+  // an Admin from silently resetting a SuperAdmin's OPAQUE credentials.
+  async updateUser(userId, changes, opts = {}) {
     const body = { userId, ...changes };
-    if (changes.password) {
+    let reauthToken = state.reauthToken;
+
+    const credentialChange = !!changes.password;
+    const roleChange =
+      (Array.isArray(changes.newRoles) && changes.newRoles.length > 0) ||
+      !!changes.newRole;
+    const needsReauth = credentialChange || roleChange;
+
+    if (credentialChange) {
       const clientState = newOpaqueState();
       const registrationRequest = opaqueStartReg(clientState, changes.password);
 
@@ -835,16 +943,48 @@ export const SecureAuth = {
       body.encrypted_rsa_private_key = b64encode(encPriv);
       body.private_key_nonce = b64encode(nonce);
       body.private_key_salt = b64encode(salt);
+      body.private_key_kdf_info = "SecureAuth RSA private key";
       body.ksf_salt = b64encode(ksfSalt);
       if (encSignPriv) {
         body.encrypted_rsa_signing_private_key = b64encode(encSignPriv);
         body.signing_key_nonce = b64encode(signNonce);
         body.signing_key_salt = b64encode(signSalt);
+        body.signing_key_kdf_info = "SecureAuth RSA signing private key";
       }
       delete body.password;
       zeroise(exportKey, kPriv);
     }
-    return jsonFetch("/api/updateuser", body);
+
+    if (needsReauth && !reauthToken) {
+      if (opts.reauthPassword) {
+        reauthToken = await this.reauthenticate(opts.reauthPassword);
+      }
+    }
+    if (needsReauth && !reauthToken) {
+      throw new Error(
+        "SecureAuth: re-authentication required to change credentials or roles. " +
+          "Call SecureAuth.reauthenticate(password) first, or pass " +
+          "{ reauthPassword } to updateUser().",
+      );
+    }
+
+    const headers = { "Content-Type": "application/json" };
+    const csrf = getCsrfToken();
+    if (csrf) headers["X-CSRF-Token"] = csrf;
+    if (reauthToken) headers["X-Reauth-Token"] = reauthToken;
+
+    const res = await fetch("/api/updateuser", {
+      method: "POST",
+      credentials: "same-origin",
+      headers,
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      throw new Error(`SecureAuth: updateuser -> ${res.status} ${text}`);
+    }
+    state.reauthToken = null;
+    return res.json();
   },
 
   // -------------------------------------------------------------------------
@@ -991,9 +1131,6 @@ export const SecureAuth = {
     return b64decode(u.rsa_public_key);
   },
 
-  // resolveMasterkey(authId) unwraps the caller's shared key for the given
-  // authorization ID and caches the plaintext in session memory. Downstream
-  // applications use this to obtain per-resource masterkeys.
   async getMasterkey(authId) {
     return resolveMasterkey(authId);
   },
@@ -1006,8 +1143,6 @@ export const SecureAuth = {
     }
   },
 
-  // setBootstrapToken is exposed for hosts that want to seed the token from
-  // an out-of-band channel instead of the auto-bootstrap path.
   setBootstrapToken(token) {
     state.bootstrapToken = token;
   },
@@ -1016,22 +1151,14 @@ export const SecureAuth = {
   // 2FA / TOTP methods
   // -------------------------------------------------------------------------
 
-  // get2faStatus() — returns { enabled, required, configured }
   async get2faStatus() {
     return jsonFetch("/api/2fa/status");
   },
 
-  // begin2faSetup() — starts TOTP enrollment.
-  // Returns { challengeId, provisioningUri, secret, sealedSecret }
-  // The caller should display provisioningUri as a QR code and ask the user
-  // to scan it, then call finish2faSetup() with the confirmation code.
   async begin2faSetup() {
     return jsonFetch("/api/2fa/setup/begin", {});
   },
 
-  // finish2faSetup(setupData, code) — confirms TOTP enrollment.
-  // setupData is the object returned by begin2faSetup().
-  // code is the 6-digit code from the authenticator app.
   async finish2faSetup(setupData, code) {
     const cleanCode = (code || "").replace(/\s/g, "");
     const result = await jsonFetch("/api/2fa/setup/finish", {
@@ -1043,9 +1170,6 @@ export const SecureAuth = {
     return result;
   },
 
-  // verify2fa(code) — verifies a TOTP code for a session that is totp_pending.
-  // Must be called after login() when totpRequired is true and totpConfigured
-  // is also true. On success the session becomes fully authenticated.
   async verify2fa(code) {
     const cleanCode = (code || "").replace(/\s/g, "");
     const result = await jsonFetch("/api/2fa/verify", { code: cleanCode });
@@ -1053,9 +1177,6 @@ export const SecureAuth = {
     return result;
   },
 
-  // disable2fa(code) — disables TOTP for the current user.
-  // Requires the user's current authenticator code as confirmation.
-  // Will throw if 2FA is enforced server-side (Require2FA: true).
   async disable2fa(code) {
     const cleanCode = (code || "").replace(/\s/g, "");
     const result = await jsonFetch("/api/2fa/disable", { code: cleanCode });
@@ -1065,5 +1186,18 @@ export const SecureAuth = {
 };
 
 if (typeof window !== "undefined") {
-  window.SecureAuth = SecureAuth;
+  const SENSITIVE = new Set([
+    "getMasterkey",
+    "forgetMasterkey",
+    "currentRsaPrivateKey",
+    "currentRsaSigningKey",
+    "currentRsaPublicKey",
+  ]);
+	window.SecureAuth = new Proxy(SecureAuth, {
+		get(target, prop) {
+			if (typeof prop === "string" && SENSITIVE.has(prop)) return undefined;
+			const v = target[prop];
+			return typeof v === "function" ? v.bind(target) : v;
+		},
+	});
 }

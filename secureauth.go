@@ -65,7 +65,7 @@ type InitOptions struct {
 	TLSCertificate []byte
 	TrustedProxies []string
 	Debug          bool
-	Require2FA     bool // if true, users must set up TOTP before accessing anything
+	Require2FA     bool
 	TOTPIssuer     string
 }
 
@@ -93,6 +93,8 @@ type SecureAuth struct {
 	sessionTTL          time.Duration
 	loginAttemptTTL     time.Duration
 	loginReturnEndpoint string
+
+	gcStop chan struct{}
 }
 
 const maxBodyBytes = 256 * 1024
@@ -116,6 +118,7 @@ const (
 	tblEncryptedData  = "_secureauth_encrypted_data_9f3a"
 	tblBootstrap      = "_secureauth_bootstrap_9f3a"
 	tblTOTPChallenges = "_secureauth_totp_challenges_9f3a"
+	tblReauthTokens   = "_secureauth_reauth_tokens_9f3a"
 )
 
 // ---------------------------------------------------------------------------
@@ -145,6 +148,7 @@ func Init(dbdriver string, dsn string, opts InitOptions) (*SecureAuth, error) {
 		rl:              newRateLimiter(),
 		debug:           opts.Debug,
 		require2FA:      opts.Require2FA,
+		gcStop:          make(chan struct{}),
 	}
 	sa.masterKey = make([]byte, 32)
 	copy(sa.masterKey, opts.MasterKey)
@@ -174,9 +178,6 @@ func Init(dbdriver string, dsn string, opts InitOptions) (*SecureAuth, error) {
 		h := sha256.Sum256(opts.TLSCertificate)
 		sa.tlsEndPoint = h[:]
 	case opts.Debug:
-		// Debug mode with no cert: derive a fixed, well-known channel-binding
-		// value so client and server agree on the transcript input. This value
-		// MUST NOT be used outside debug — it provides no binding.
 		h := sha256.Sum256([]byte("secureauth:debug:no-channel-binding:v1"))
 		sa.tlsEndPoint = h[:]
 		log.Printf("secureauth: DEBUG — no TLS certificate, using fixed channel binding")
@@ -191,14 +192,12 @@ func Init(dbdriver string, dsn string, opts InitOptions) (*SecureAuth, error) {
 	sa.bootstrapToken = []byte(opts.BootstrapToken)
 
 	conf := &opaque.Configuration{
-		OPRF: opaque.RistrettoSha512,
-		AKE:  opaque.RistrettoSha512,
-		KSF:  ksf.Argon2id,
-		KDF:  crypto.SHA512,
-		MAC:  crypto.SHA512,
-		Hash: crypto.SHA512,
-		// Non-nil empty slice so bytemare emits the I2OSP(len(context), 2)
-		// || context field inside the OPAQUE-3DH preamble.
+		OPRF:    opaque.RistrettoSha512,
+		AKE:     opaque.RistrettoSha512,
+		KSF:     ksf.Argon2id,
+		KDF:     crypto.SHA512,
+		MAC:     crypto.SHA512,
+		Hash:    crypto.SHA512,
 		Context: []byte{},
 	}
 	sa.opaqueConf = conf
@@ -227,7 +226,25 @@ func Init(dbdriver string, dsn string, opts InitOptions) (*SecureAuth, error) {
 		return nil, err
 	}
 
+	// Pre-populate the rate limiter from recent failed logins so a restart
+	// cannot be used to reset brute-force budgets.
+	sa.prepopulateRateLimiter()
+
+	// Background GC for short-lived rows.
+	go sa.gcExpiredRows()
+
 	return sa, nil
+}
+
+// Close stops the background GC goroutine. Optional; the process exit path
+// does not need to call it.
+func (sa *SecureAuth) Close() error {
+	select {
+	case <-sa.gcStop:
+	default:
+		close(sa.gcStop)
+	}
+	return sa.db.Close()
 }
 
 func (sa *SecureAuth) loadOrGenerateOPAQUEKeyMaterial() error {
@@ -394,6 +411,13 @@ func (sa *SecureAuth) createTables() error {
 			created_at TIMESTAMP NOT NULL,
 			expires_at TIMESTAMP NOT NULL
 		)`,
+		`CREATE TABLE IF NOT EXISTS ` + tblReauthTokens + ` (
+			token TEXT PRIMARY KEY,
+			user_id TEXT NOT NULL,
+			created_at TIMESTAMP NOT NULL,
+			expires_at TIMESTAMP NOT NULL,
+			used INTEGER NOT NULL DEFAULT 0
+		)`,
 	}
 	for _, s := range stmts {
 		if _, err := sa.db.Exec(s); err != nil {
@@ -414,8 +438,12 @@ func (sa *SecureAuth) createTables() error {
 		// TOTP columns on users table
 		`ALTER TABLE ` + tblUsers + ` ADD COLUMN totp_secret BLOB`,
 		`ALTER TABLE ` + tblUsers + ` ADD COLUMN totp_enabled INTEGER NOT NULL DEFAULT 0`,
+		// Replay-protection: last TOTP step counter consumed by this user.
+		`ALTER TABLE ` + tblUsers + ` ADD COLUMN totp_last_step INTEGER NOT NULL DEFAULT 0`,
 		// 2FA pending flag on sessions (set after password but before TOTP)
 		`ALTER TABLE ` + tblSessions + ` ADD COLUMN totp_pending INTEGER NOT NULL DEFAULT 0`,
+		// Purpose column on login attempts (login vs reauth).
+		`ALTER TABLE ` + tblLoginAttempts + ` ADD COLUMN purpose TEXT NOT NULL DEFAULT 'login'`,
 	}
 	for _, m := range migrations {
 		_, _ = sa.db.Exec(m)
@@ -618,6 +646,19 @@ func (sa *SecureAuth) open(ciphertext, aad []byte) ([]byte, error) {
 	return aead.Open(nil, nonce, ct, aad)
 }
 
+// SealData encrypts plaintext with the server master key, binding it to aad.
+// The nonce is prepended to the ciphertext. Exposed so host applications can
+// protect at-rest data with the same root of trust SecureAuth uses for the
+// OPAQUE server key material and session keys.
+func (sa *SecureAuth) SealData(plaintext, aad []byte) ([]byte, error) {
+	return sa.seal(plaintext, aad)
+}
+
+// OpenData decrypts a blob produced by SealData.
+func (sa *SecureAuth) OpenData(ciphertext, aad []byte) ([]byte, error) {
+	return sa.open(ciphertext, aad)
+}
+
 func hkdfExpand(ikm, info []byte, n int) []byte {
 	r := hkdf.New(sha256.New, ikm, hkdfSalt, info)
 	out := make([]byte, n)
@@ -683,7 +724,6 @@ func (sa *SecureAuth) hasRegisteredUsers(ctx context.Context) (bool, error) {
 	return count > 0, nil
 }
 
-// authorizationName returns the name of an authorization row, or sql.ErrNoRows.
 func (sa *SecureAuth) authorizationName(authID string) (string, error) {
 	var name string
 	err := sa.db.QueryRow(
@@ -692,19 +732,14 @@ func (sa *SecureAuth) authorizationName(authID string) (string, error) {
 	return name, err
 }
 
-// revokeStaleSharedKeysTx revokes any shared key row whose (user, authorization)
-// pair is no longer backed by a role grant. It must be called after any change
-// to tblUserRoles or tblRoleAuth, inside the same transaction.
 func revokeStaleSharedKeysTx(tx *sql.Tx, now time.Time) error {
 	_, err := tx.Exec(`
 		UPDATE `+tblSharedKeys+` SET revoked_at = ?, revocation_reason = 'permissions changed'
 		WHERE revoked_at IS NULL
-		  -- Only consider keys whose authorization is actually role-granted.
 		  AND EXISTS (
 			SELECT 1 FROM `+tblRoleAuth+` ra
 			WHERE ra.authorization_id = `+tblSharedKeys+`.authorization_id
 		  )
-		  -- ...and revoke only if the user no longer holds any role that grants it.
 		  AND NOT EXISTS (
 			SELECT 1 FROM `+tblRoleAuth+` ra
 			JOIN `+tblUserRoles+` ur ON ur.role_id = ra.role_id
@@ -715,34 +750,76 @@ func revokeStaleSharedKeysTx(tx *sql.Tx, now time.Time) error {
 }
 
 // ---------------------------------------------------------------------------
-// Programmatic authorization & role registration
-//
-// These functions let a host application declare its own authorizations and
-// roles before the first admin bootstraps. When a pending bootstrap record
-// exists, a fresh 32-byte masterkey is generated for each newly registered
-// authorization and sealed inside the bootstrap payload, so the first admin
-// automatically receives a wrapped copy of it during first login. This is
-// the programmatic equivalent of seeding additional authorizations at Init
-// time.
-//
-// After bootstrap has completed, RegisterAuthorization inserts the row but
-// does not create a masterkey (post-bootstrap masterkey distribution is
-// handled by the HTTP API and the browser client). To avoid name collisions
-// and to keep the data store usable from day one, register all custom
-// authorizations before the first admin logs in.
+// ClientIP / rate-limiter persistence
 // ---------------------------------------------------------------------------
 
-// RegisterAuthorization registers an authorization with an explicit ID.
-//
-// id must be non-empty and unique. name must be non-empty and unique. Both
-// are enforced by the database; the function returns a descriptive error if
-// either collides with an existing row.
-//
-// Idempotent: calling RegisterAuthorization with the same (id, name) pair
-// that is already present is a no-op that returns nil.
-//
-// Intended to be called after Init but before the first admin bootstraps.
-// See the package comment above for the post-bootstrap caveat.
+// ClientIP exposes SecureAuth's trusted-proxy–aware client IP resolution so
+// host applications can reuse the same logic (and, crucially, the same
+// X-Forwarded-For trust decisions) instead of reimplementing it.
+func (sa *SecureAuth) ClientIP(r *http.Request) string {
+	return sa.clientIP(r)
+}
+
+// fakeKSFSalt returns a deterministic, secret-derived salt for a username
+// that does not exist. Using a stable value (instead of a fresh random salt
+// per request) prevents an attacker from distinguishing real from
+// non-existent users by observing salt stability across probes.
+func (sa *SecureAuth) fakeKSFSalt(username string) []byte {
+	return hmacSHA256(sa.masterKey, []byte("fake-ksf-salt:"+username))
+}
+
+// prepopulateRateLimiter reads the audit log for recent failed login2
+// entries and installs zero-token buckets for those users, so that a restart
+// cannot be used to reset the per-user brute-force budget.
+func (sa *SecureAuth) prepopulateRateLimiter() {
+	since := time.Now().UTC().Add(-sa.loginAttemptTTL)
+	rows, err := sa.db.Query(
+		`SELECT DISTINCT user_id FROM `+tblAudit+`
+		 WHERE action = 'login2' AND result = 'deny' AND timestamp > ?`,
+		since.Format(time.RFC3339Nano),
+	)
+	if err != nil {
+		return
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var uid string
+		if err := rows.Scan(&uid); err != nil || uid == "" {
+			continue
+		}
+		sa.rl.setTokens("login2-user:"+uid, 0)
+		sa.rl.setTokens("login-init-user:"+uid, 0)
+	}
+}
+
+// gcExpiredRows periodically removes rows whose TTL has elapsed. Runs until
+// sa.gcStop is closed (via Close).
+func (sa *SecureAuth) gcExpiredRows() {
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-sa.gcStop:
+			return
+		case <-ticker.C:
+			now := time.Now().UTC()
+			_, _ = sa.db.Exec(`DELETE FROM `+tblLoginAttempts+` WHERE expires_at < ?`, now)
+			_, _ = sa.db.Exec(`DELETE FROM `+tblTOTPChallenges+` WHERE expires_at < ?`, now)
+			_, _ = sa.db.Exec(`DELETE FROM `+tblPendingRegs+` WHERE expires_at < ?`, now)
+			_, _ = sa.db.Exec(
+				`DELETE FROM `+tblReauthTokens+` WHERE expires_at < ? OR used = 1`,
+				now,
+			)
+			// Sessions are cleaned lazily on access, but run a sweep too.
+			_, _ = sa.db.Exec(`DELETE FROM `+tblSessions+` WHERE expires_at < ?`, now)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Programmatic authorization & role registration
+// ---------------------------------------------------------------------------
+
 func (sa *SecureAuth) RegisterAuthorization(id, name, description string) error {
 	if id == "" || name == "" {
 		return errors.New("secureauth: RegisterAuthorization: id and name are required")
@@ -769,7 +846,6 @@ func (sa *SecureAuth) RegisterAuthorization(id, name, description string) error 
 				id, existingName,
 			)
 		}
-		// Same id, same name → idempotent. Fall through to masterkey check.
 	case errID == sql.ErrNoRows:
 		var existingID string
 		errName := tx.QueryRow(
@@ -804,9 +880,6 @@ func (sa *SecureAuth) RegisterAuthorization(id, name, description string) error 
 	return nil
 }
 
-// RegisterAuthorizationByName is a convenience wrapper that derives the ID
-// as "auth-" + name, matching the convention used by the preset
-// authorizations. Returns the derived ID on success.
 func (sa *SecureAuth) RegisterAuthorizationByName(name, description string) (string, error) {
 	if name == "" {
 		return "", errors.New("secureauth: RegisterAuthorizationByName: name is required")
@@ -818,17 +891,6 @@ func (sa *SecureAuth) RegisterAuthorizationByName(name, description string) (str
 	return id, nil
 }
 
-// RegisterRole registers a role with an explicit ID and links it to the
-// given authorization IDs. Each authorization ID must already be registered
-// (via RegisterAuthorization, RegisterAuthorizationByName, or the presets).
-//
-// Intended to be called after Init but before the first admin bootstraps,
-// although it is safe to call at any time. Unlike RegisterAuthorization,
-// registering a role never touches the bootstrap masterkeys.
-//
-// Idempotent: calling RegisterRole with the same (id, name) pair that is
-// already present is a no-op for the role row, but the authorization links
-// are still ensured (existing links are preserved, new ones are added).
 func (sa *SecureAuth) RegisterRole(id, name, description string, authorizationIDs []string) error {
 	if id == "" || name == "" {
 		return errors.New("secureauth: RegisterRole: id and name are required")
@@ -868,7 +930,6 @@ func (sa *SecureAuth) RegisterRole(id, name, description string, authorizationID
 				id, existingName,
 			)
 		}
-		// Same id, same name → idempotent. Fall through to link insertion.
 	case errID == sql.ErrNoRows:
 		var existingID string
 		errName := tx.QueryRow(
@@ -908,9 +969,6 @@ func (sa *SecureAuth) RegisterRole(id, name, description string, authorizationID
 	return nil
 }
 
-// RegisterRoleByName is a convenience wrapper that derives the role ID as
-// "role-" + name and resolves each authorization name to its registered ID.
-// Returns the derived role ID on success.
 func (sa *SecureAuth) RegisterRoleByName(name, description string, authorizationNames []string) (string, error) {
 	if name == "" {
 		return "", errors.New("secureauth: RegisterRoleByName: name is required")
@@ -938,10 +996,6 @@ func (sa *SecureAuth) RegisterRoleByName(name, description string, authorization
 	return id, nil
 }
 
-// addBootstrapMasterkeyTx ensures the pending bootstrap record (if any) holds
-// a fresh masterkey for the given authorization ID. It is a no-op when no
-// bootstrap record exists or when bootstrap has already been consumed, and
-// when the authorization already has a masterkey in the sealed blob.
 func (sa *SecureAuth) addBootstrapMasterkeyTx(tx *sql.Tx, authID string) error {
 	var consumed int
 	var sealedMK []byte
@@ -997,38 +1051,20 @@ func (sa *SecureAuth) addBootstrapMasterkeyTx(tx *sql.Tx, authID string) error {
 
 // ---------------------------------------------------------------------------
 // Host-application integration helpers
-//
-// These functions are exposed so a host application built on top of
-// SecureAuth can perform the same checks and emit the same audit entries as
-// SecureAuth's own handlers, without needing access to the private API.
 // ---------------------------------------------------------------------------
 
-// AppendAudit appends one entry to the tamper-evident audit chain. Exposed
-// so host applications can log their own mutations into the same hash chain
-// as SecureAuth's built-in operations (see VerifyAuditChain).
-//
-// (action, resource, result, details) are free-form; SecureAuth itself uses
-// action ∈ {"authorize", "login2", "user.create", ...} and result ∈
-// {"allow", "deny"}. Hosts should follow the same convention.
 func (sa *SecureAuth) AppendAudit(userID, action, resource, result, ip, details string) {
 	sa.appendAudit(userID, action, resource, result, ip, details)
 }
 
-// UserHasPermission reports whether userID currently holds the named
-// authorization, without requiring an *http.Request. Role-based only; see
-// UserHasAuthorization for the role-or-shared-key variant.
 func (sa *SecureAuth) UserHasPermission(userID, permission string) (bool, error) {
 	return sa.userHasPermission(userID, permission)
 }
 
-// AuthorizationNameByID resolves an authorization ID to its name. Returns
-// sql.ErrNoRows when the ID is unknown.
 func (sa *SecureAuth) AuthorizationNameByID(authID string) (string, error) {
 	return sa.authorizationName(authID)
 }
 
-// UserExists reports whether a username is registered. Used by hosts to
-// validate share targets before storing wrapped keys for them.
 func (sa *SecureAuth) UserExists(username string) (bool, error) {
 	var one int
 	err := sa.db.QueryRow(
@@ -1047,20 +1083,16 @@ func (sa *SecureAuth) UserExists(username string) (bool, error) {
 // TOTP (RFC 6238 / RFC 4226) — pure-stdlib implementation
 // ---------------------------------------------------------------------------
 
-// totpGenerateSecret creates a random 20-byte TOTP secret and seals it with
-// the server master key before storage.
 func (sa *SecureAuth) totpGenerateSecret() (raw []byte, sealed []byte, err error) {
 	raw = randomBytes(20)
 	sealed, err = sa.seal(raw, []byte("secureauth:totp-secret:v1"))
 	return
 }
 
-// totpOpenSecret decrypts a sealed TOTP secret.
 func (sa *SecureAuth) totpOpenSecret(sealed []byte) ([]byte, error) {
 	return sa.open(sealed, []byte("secureauth:totp-secret:v1"))
 }
 
-// totpHOTP implements RFC 4226.
 func totpHOTP(secret []byte, counter uint64, digits int) string {
 	msg := make([]byte, 8)
 	binary.BigEndian.PutUint64(msg, counter)
@@ -1074,25 +1106,40 @@ func totpHOTP(secret []byte, counter uint64, digits int) string {
 }
 
 // totpVerify checks the provided 6-digit code against the secret, accepting
-// a window of ±1 step (30s) to tolerate clock skew.
-func totpVerify(secret []byte, code string, t time.Time) bool {
+// a window of ±1 step (30s) to tolerate clock skew. It returns the matched
+// step counter (Unix/30) so callers can enforce replay protection, and a
+// boolean indicating whether any step matched.
+func totpVerify(secret []byte, code string, t time.Time) (uint64, bool) {
 	if len(code) != 6 {
-		return false
+		return 0, false
 	}
 	step := uint64(t.Unix() / 30)
-	for _, s := range []uint64{step - 1, step, step + 1} {
+	// Check in order so the highest matched step wins.
+	candidates := []uint64{step + 1, step, step - 1}
+	for _, s := range candidates {
 		if subtle.ConstantTimeCompare([]byte(totpHOTP(secret, s, 6)), []byte(code)) == 1 {
-			return true
+			return s, true
 		}
 	}
-	return false
+	return 0, false
 }
 
-// SetTOTPIssuer overrides the display name shown by authenticator apps for
-// this server. Call it once at startup, before serving requests — it is not
-// synchronised and concurrent calls would race.
-//
-// An empty string restores the default (ServerID).
+// recordTOTPStep atomically advances the user's last-consumed TOTP step
+// counter. Returns true if the step was accepted, false if the code has
+// already been used (or a concurrent request consumed it first).
+func (sa *SecureAuth) recordTOTPStep(username string, step uint64) bool {
+	res, err := sa.db.Exec(
+		`UPDATE `+tblUsers+` SET totp_last_step = ?
+		 WHERE username = ? AND totp_last_step < ?`,
+		step, username, step,
+	)
+	if err != nil {
+		return false
+	}
+	n, _ := res.RowsAffected()
+	return n > 0
+}
+
 func (sa *SecureAuth) SetTOTPIssuer(issuer string) {
 	if issuer == "" {
 		issuer = string(sa.serverID)
@@ -1100,10 +1147,6 @@ func (sa *SecureAuth) SetTOTPIssuer(issuer string) {
 	sa.totpIssuer = sanitizeTOTPIssuer(issuer)
 }
 
-// sanitizeTOTPIssuer removes characters that would break the otpauth://
-// label format. Google's key-uri spec uses ":" as the separator between the
-// issuer and the account name, so an unescaped colon in the issuer would
-// make authenticator apps show a truncated or garbled label.
 func sanitizeTOTPIssuer(issuer string) string {
 	issuer = strings.TrimSpace(issuer)
 	issuer = strings.ReplaceAll(issuer, ":", "")
@@ -1113,7 +1156,6 @@ func sanitizeTOTPIssuer(issuer string) string {
 	return issuer
 }
 
-// totpProvisioningURI returns an otpauth:// URI for QR code generation.
 func totpProvisioningURI(secret []byte, username, issuer string) string {
 	b32 := base32.StdEncoding.WithPadding(base32.StdPadding).EncodeToString(secret)
 	label := url.PathEscape(issuer + ":" + username)
@@ -1126,8 +1168,6 @@ func totpProvisioningURI(secret []byte, username, issuer string) string {
 	return "otpauth://totp/" + label + "?" + v.Encode()
 }
 
-// sessionIsTOTPPending reports whether the session has completed password auth
-// but is still waiting for TOTP verification.
 func (sa *SecureAuth) sessionIsTOTPPending(sessionID string) bool {
 	var pending int
 	_ = sa.db.QueryRow(
@@ -1136,7 +1176,6 @@ func (sa *SecureAuth) sessionIsTOTPPending(sessionID string) bool {
 	return pending == 1
 }
 
-// userHasTOTP reports whether the user has TOTP enabled.
 func (sa *SecureAuth) userHasTOTP(username string) (bool, error) {
 	var enabled int
 	err := sa.db.QueryRow(
@@ -1149,11 +1188,56 @@ func (sa *SecureAuth) userHasTOTP(username string) (bool, error) {
 }
 
 // ---------------------------------------------------------------------------
+// Re-authentication tokens (used to gate credential-changing operations)
+// ---------------------------------------------------------------------------
+
+// issueReauthToken mints a single-use, 5-minute re-authentication token for
+// the given user. It is returned to the client, which then presents it in
+// the X-Reauth-Token header when performing a credential-changing operation.
+func (sa *SecureAuth) issueReauthToken(userID string) (string, error) {
+	token := hex.EncodeToString(randomBytes(32))
+	now := time.Now().UTC()
+	_, err := sa.db.Exec(
+		`INSERT INTO `+tblReauthTokens+`
+		 (token, user_id, created_at, expires_at, used)
+		 VALUES (?, ?, ?, ?, 0)`,
+		token, userID, now, now.Add(5*time.Minute),
+	)
+	if err != nil {
+		return "", err
+	}
+	return token, nil
+}
+
+// checkReauthToken reports whether the token is a valid, unused, unexpired
+// reauth token bound to userID.
+func (sa *SecureAuth) checkReauthToken(userID, token string) bool {
+	if token == "" || userID == "" {
+		return false
+	}
+	var one int
+	err := sa.db.QueryRow(
+		`SELECT 1 FROM `+tblReauthTokens+`
+		 WHERE token = ? AND user_id = ? AND used = 0 AND expires_at > ?`,
+		token, userID, time.Now().UTC(),
+	).Scan(&one)
+	return err == nil
+}
+
+// consumeReauthToken marks the token used. Safe to call after a successful
+// check; the WHERE clause guarantees a token can only be consumed once.
+func (sa *SecureAuth) consumeReauthToken(userID, token string) {
+	_, _ = sa.db.Exec(
+		`UPDATE `+tblReauthTokens+` SET used = 1
+		 WHERE token = ? AND user_id = ? AND used = 0`,
+		token, userID,
+	)
+}
+
+// ---------------------------------------------------------------------------
 // 2FA HTTP handlers  (served under /api/2fa/*)
 // ---------------------------------------------------------------------------
 
-// handleTOTPStatus — GET /api/2fa/status
-// Returns whether the current user has TOTP enabled.
 func (sa *SecureAuth) handleTOTPStatus(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -1177,11 +1261,22 @@ func (sa *SecureAuth) handleTOTPStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleTOTPSetupBegin — POST /api/2fa/setup/begin
-// Generates a fresh TOTP secret, seals it in a temporary challenge row,
-// and returns the provisioning URI + base32 secret for QR display.
+//
+// Generates a fresh TOTP secret, seals it in a temporary challenge row, and
+// returns the provisioning URI + base32 secret for QR display.
+//
+// Blocked when the session is TOTP-pending AND the user already has 2FA
+// configured: in that case the caller must verify, not re-enroll. Without
+// this gate, an attacker with a stolen totp_pending session could silently
+// overwrite the victim's authenticator registration.
 func (sa *SecureAuth) handleTOTPSetupBegin(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	ip := sa.clientIP(r)
+	if !sa.rl.allow("2fa-setup:"+ip, 5, 1.0/300.0) {
+		http.Error(w, "rate limited", http.StatusTooManyRequests)
 		return
 	}
 	sess, err := sa.loadSessionInfo(r)
@@ -1189,9 +1284,22 @@ func (sa *SecureAuth) handleTOTPSetupBegin(w http.ResponseWriter, r *http.Reques
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
-	// If 2FA is enforced and the session is still pending verification,
-	// we allow setup to proceed (that's the point of the redirect).
-	// But if there's an *existing* pending TOTP challenge, delete it first.
+
+	// If the user already has TOTP enabled, setup can only proceed from a
+	// fully-verified session — a totp_pending session must verify instead.
+	if sess.TOTPPending {
+		alreadyEnabled, _ := sa.userHasTOTP(sess.UserID)
+		if alreadyEnabled {
+			sa.appendAudit(sess.UserID, "2fa.setup", "", "deny", ip,
+				"re-enrollment blocked on pending session")
+			http.Error(w,
+				"complete 2FA verification before modifying 2FA settings",
+				http.StatusForbidden)
+			return
+		}
+	}
+
+	// If there is an existing pending TOTP challenge, delete it first.
 	_, _ = sa.db.Exec(
 		`DELETE FROM `+tblTOTPChallenges+` WHERE session_id = ?`, sess.SessionID,
 	)
@@ -1215,8 +1323,6 @@ func (sa *SecureAuth) handleTOTPSetupBegin(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	// Seal the temporary secret keyed to the challenge ID so it can't be
-	// replayed across sessions.
 	sealedForChallenge, err := sa.seal(sealed, []byte("secureauth:totp-setup-challenge:"+challengeID))
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
@@ -1226,7 +1332,6 @@ func (sa *SecureAuth) handleTOTPSetupBegin(w http.ResponseWriter, r *http.Reques
 	uri := totpProvisioningURI(raw, sess.UserID, sa.totpIssuer)
 	b32 := base32.StdEncoding.WithPadding(base32.StdPadding).EncodeToString(raw)
 
-	// Wipe plaintext secret from memory
 	for i := range raw {
 		raw[i] = 0
 	}
@@ -1240,17 +1345,37 @@ func (sa *SecureAuth) handleTOTPSetupBegin(w http.ResponseWriter, r *http.Reques
 }
 
 // handleTOTPSetupFinish — POST /api/2fa/setup/finish
-// Verifies the user's first TOTP code, then persists the sealed secret
-// and marks totp_enabled = 1.
+//
+// Verifies the user's first TOTP code, then persists the sealed secret and
+// marks totp_enabled = 1.
 func (sa *SecureAuth) handleTOTPSetupFinish(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	ip := sa.clientIP(r)
+	if !sa.rl.allow("2fa-setup-finish:"+ip, 10, 1.0/60.0) {
+		http.Error(w, "rate limited", http.StatusTooManyRequests)
 		return
 	}
 	sess, err := sa.loadSessionInfo(r)
 	if err != nil {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
+	}
+
+	// Same gate as handleTOTPSetupBegin: a pending session for a user who
+	// already has 2FA enabled must verify, not re-enroll.
+	if sess.TOTPPending {
+		alreadyEnabled, _ := sa.userHasTOTP(sess.UserID)
+		if alreadyEnabled {
+			sa.appendAudit(sess.UserID, "2fa.setup", "", "deny", ip,
+				"re-enrollment blocked on pending session")
+			http.Error(w,
+				"complete 2FA verification before modifying 2FA settings",
+				http.StatusForbidden)
+			return
+		}
 	}
 
 	var req struct {
@@ -1263,7 +1388,6 @@ func (sa *SecureAuth) handleTOTPSetupFinish(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	// Verify the challenge belongs to this session and is unexpired.
 	var storedSessionID string
 	var expires time.Time
 	err = sa.db.QueryRow(
@@ -1276,7 +1400,6 @@ func (sa *SecureAuth) handleTOTPSetupFinish(w http.ResponseWriter, r *http.Reque
 	}
 	_, _ = sa.db.Exec(`DELETE FROM `+tblTOTPChallenges+` WHERE id = ?`, req.ChallengeID)
 
-	// Unseal the temporary secret.
 	sealedForChallenge, err := base64.StdEncoding.DecodeString(req.SealedSecret)
 	if err != nil {
 		http.Error(w, "bad request: sealedSecret", http.StatusBadRequest)
@@ -1298,17 +1421,20 @@ func (sa *SecureAuth) handleTOTPSetupFinish(w http.ResponseWriter, r *http.Reque
 		}
 	}()
 
-	if !totpVerify(raw, req.Code, time.Now()) {
-		sa.appendAudit(sess.UserID, "2fa.setup", "", "deny", sa.clientIP(r), "invalid code")
+	matchedStep, ok := totpVerify(raw, req.Code, time.Now())
+	if !ok {
+		sa.appendAudit(sess.UserID, "2fa.setup", "", "deny", ip, "invalid code")
 		http.Error(w, "invalid TOTP code", http.StatusUnauthorized)
 		return
 	}
 
-	// Persist the sealed secret and mark TOTP enabled. Also clear any
-	// totp_pending flag on the current session.
+	// New secret is being installed: overwrite totp_last_step with the
+	// matched step unconditionally.
 	_, err = sa.db.Exec(
-		`UPDATE `+tblUsers+` SET totp_secret = ?, totp_enabled = 1 WHERE username = ?`,
-		innerSealed, sess.UserID,
+		`UPDATE `+tblUsers+`
+		 SET totp_secret = ?, totp_enabled = 1, totp_last_step = ?
+		 WHERE username = ?`,
+		innerSealed, matchedStep, sess.UserID,
 	)
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
@@ -1318,13 +1444,11 @@ func (sa *SecureAuth) handleTOTPSetupFinish(w http.ResponseWriter, r *http.Reque
 		`UPDATE `+tblSessions+` SET totp_pending = 0 WHERE session_id = ?`, sess.SessionID,
 	)
 
-	sa.appendAudit(sess.UserID, "2fa.setup", "", "allow", sa.clientIP(r), "")
+	sa.appendAudit(sess.UserID, "2fa.setup", "", "allow", ip, "")
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
 // handleTOTPVerify — POST /api/2fa/verify
-// Called immediately after login when the user has TOTP enabled (or when
-// they are redirected to /2fa/verify from a pending session).
 func (sa *SecureAuth) handleTOTPVerify(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -1371,20 +1495,29 @@ func (sa *SecureAuth) handleTOTPVerify(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
-	if !totpVerify(raw, req.Code, time.Now()) {
+	matchedStep, ok := totpVerify(raw, req.Code, time.Now())
+	if !ok {
 		if !sa.rl.allow("2fa-fail:"+sess.UserID, 5, 1.0/120.0) {
-			// Too many failures: invalidate the session entirely.
 			_, _ = sa.db.Exec(`DELETE FROM `+tblSessions+` WHERE session_id = ?`, sess.SessionID)
 			http.SetCookie(w, &http.Cookie{
 				Name: "secureauth_session", Value: "", Path: "/", MaxAge: -1,
 				Secure: true, HttpOnly: true, SameSite: http.SameSiteLaxMode,
 			})
-			sa.appendAudit(sess.UserID, "2fa.verify", "", "deny", ip, "too many failures — session terminated")
+			sa.appendAudit(sess.UserID, "2fa.verify", "", "deny", ip,
+				"too many failures — session terminated")
 			http.Error(w, "too many failed attempts", http.StatusTooManyRequests)
 			return
 		}
 		sa.appendAudit(sess.UserID, "2fa.verify", "", "deny", ip, "invalid code")
 		http.Error(w, "invalid TOTP code", http.StatusUnauthorized)
+		return
+	}
+
+	// Replay protection: reject codes whose step counter has already been
+	// consumed for this user.
+	if !sa.recordTOTPStep(sess.UserID, matchedStep) {
+		sa.appendAudit(sess.UserID, "2fa.verify", "", "deny", ip, "replayed code")
+		http.Error(w, "TOTP code already used", http.StatusUnauthorized)
 		return
 	}
 
@@ -1396,10 +1529,14 @@ func (sa *SecureAuth) handleTOTPVerify(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleTOTPDisable — POST /api/2fa/disable
-// Disables TOTP for the authenticated user (requires a valid current code).
 func (sa *SecureAuth) handleTOTPDisable(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	ip := sa.clientIP(r)
+	if !sa.rl.allow("2fa-disable:"+ip, 5, 1.0/300.0) {
+		http.Error(w, "rate limited", http.StatusTooManyRequests)
 		return
 	}
 	sess, err := sa.loadSessionInfo(r)
@@ -1408,7 +1545,6 @@ func (sa *SecureAuth) handleTOTPDisable(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	// If 2FA is enforced server-side, nobody can disable it.
 	if sa.require2FA {
 		http.Error(w, "2FA is enforced and cannot be disabled", http.StatusForbidden)
 		return
@@ -1442,14 +1578,32 @@ func (sa *SecureAuth) handleTOTPDisable(w http.ResponseWriter, r *http.Request) 
 		}
 	}()
 
-	if !totpVerify(raw, req.Code, time.Now()) {
-		sa.appendAudit(sess.UserID, "2fa.disable", "", "deny", sa.clientIP(r), "invalid code")
+	matchedStep, ok := totpVerify(raw, req.Code, time.Now())
+	if !ok {
+		if !sa.rl.allow("2fa-disable-fail:"+sess.UserID, 3, 1.0/120.0) {
+			_, _ = sa.db.Exec(`DELETE FROM `+tblSessions+` WHERE session_id = ?`, sess.SessionID)
+			http.SetCookie(w, &http.Cookie{
+				Name: "secureauth_session", Value: "", Path: "/", MaxAge: -1,
+				Secure: true, HttpOnly: true, SameSite: http.SameSiteLaxMode,
+			})
+			sa.appendAudit(sess.UserID, "2fa.disable", "", "deny", ip,
+				"too many failures — session terminated")
+			http.Error(w, "too many failed attempts", http.StatusTooManyRequests)
+			return
+		}
+		sa.appendAudit(sess.UserID, "2fa.disable", "", "deny", ip, "invalid code")
 		http.Error(w, "invalid TOTP code", http.StatusUnauthorized)
 		return
 	}
 
+	if !sa.recordTOTPStep(sess.UserID, matchedStep) {
+		sa.appendAudit(sess.UserID, "2fa.disable", "", "deny", ip, "replayed code")
+		http.Error(w, "TOTP code already used", http.StatusUnauthorized)
+		return
+	}
+
 	_, err = sa.db.Exec(
-		`UPDATE `+tblUsers+` SET totp_secret = NULL, totp_enabled = 0 WHERE username = ?`,
+		`UPDATE `+tblUsers+` SET totp_secret = NULL, totp_enabled = 0, totp_last_step = 0 WHERE username = ?`,
 		sess.UserID,
 	)
 	if err != nil {
@@ -1457,7 +1611,7 @@ func (sa *SecureAuth) handleTOTPDisable(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	sa.appendAudit(sess.UserID, "2fa.disable", "", "allow", sa.clientIP(r), "")
+	sa.appendAudit(sess.UserID, "2fa.disable", "", "allow", ip, "")
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
@@ -1472,9 +1626,13 @@ func SecureAuthAndCommHandler(sa *SecureAuth, mux *http.ServeMux) http.Handler {
 	mux.HandleFunc("/api/login/init", sa.wrap(sa.handleLoginInit, false))
 	mux.HandleFunc("/api/login2", sa.wrap(sa.handleLogin2, false))
 
+	// Re-auth flow: requires an authenticated session, issues a short-lived
+	// single-use token that gates credential-changing operations.
+	mux.HandleFunc("/api/reauth/init", sa.wrap(sa.handleReauthInit, true))
+	mux.HandleFunc("/api/reauth/finish", sa.wrap(sa.handleReauthFinish, true))
+
 	// /logout must be CSRF-exempt: a stale session cookie can otherwise
-	// block the browser from ever clearing it (no CSRF token is available
-	// until after a successful login).
+	// block the browser from ever clearing it.
 	mux.HandleFunc("/logout", sa.wrap(sa.handleLogout, false))
 
 	mux.HandleFunc("/api/privatekey", sa.wrap(sa.loadSession(sa.handleGetPrivateKey), true))
@@ -1507,8 +1665,6 @@ func SecureAuthAndCommHandler(sa *SecureAuth, mux *http.ServeMux) http.Handler {
 	mux.HandleFunc("/api/bootstrap/masterkeys-pending", sa.wrap(sa.handleBootstrapMasterkeysPending, false))
 	mux.HandleFunc("/api/bootstrap/first-user", sa.wrap(sa.handleBootstrapFirstUser, true))
 
-	// 2FA endpoints — status and verify are accessible even with totp_pending
-	// sessions; setup/finish and disable require a fully-authenticated session.
 	mux.HandleFunc("/api/2fa/status", sa.wrap(sa.handleTOTPStatus, false))
 	mux.HandleFunc("/api/2fa/setup/begin", sa.wrap(sa.handleTOTPSetupBegin, true))
 	mux.HandleFunc("/api/2fa/setup/finish", sa.wrap(sa.handleTOTPSetupFinish, true))
@@ -1531,7 +1687,7 @@ func (sa *SecureAuth) wrap(next http.HandlerFunc, needsCSRF bool) http.HandlerFu
 			http.Error(w, "HTTPS required", http.StatusForbidden)
 			return
 		}
-		r = sa.setSecurityHeaders(w, r) // ← was setSecurityHeaders(w, r)
+		r = sa.setSecurityHeaders(w, r)
 
 		if needsCSRF && sessionIDFromRequest(r) != "" {
 			if _, err := sa.loadSessionInfo(r); err == nil {
@@ -1636,6 +1792,14 @@ func (rl *rateLimiter) allow(key string, burst float64, refillPerSec float64) bo
 	return true
 }
 
+// setTokens forcefully sets the token count for a key. Used at startup to
+// restore brute-force budgets from the persisted audit log.
+func (rl *rateLimiter) setTokens(key string, tokens float64) {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+	rl.buckets[key] = &bucket{tokens: tokens, lastSeen: time.Now()}
+}
+
 // ---------------------------------------------------------------------------
 // Audit log
 // ---------------------------------------------------------------------------
@@ -1715,7 +1879,6 @@ func (sa *SecureAuth) VerifyAuditChain() error {
 func (sa *SecureAuth) newCSRF(sessionID string) (token, cookieValue string) {
 	raw := randomBytes(32)
 	token = base64.StdEncoding.EncodeToString(raw)
-	// Same value goes in the cookie and the DB. Classic double-submit.
 	return token, token
 }
 
@@ -1758,7 +1921,7 @@ type sessionInfo struct {
 	Key         []byte
 	CSRF        string
 	ExpiresAt   time.Time
-	TOTPPending bool // password auth done but TOTP not yet verified
+	TOTPPending bool
 }
 
 func (sa *SecureAuth) loadSessionInfo(r *http.Request) (*sessionInfo, error) {
@@ -1813,10 +1976,7 @@ func (sa *SecureAuth) loadSession(next func(http.ResponseWriter, *http.Request, 
 	}
 }
 
-// respondTOTPRequired writes the JSON envelope that the client uses to detect
-// that it must complete 2FA before proceeding.
 func (sa *SecureAuth) respondTOTPRequired(w http.ResponseWriter, userID string) {
-	// Check whether the user has TOTP configured or needs to set it up.
 	configured, _ := sa.userHasTOTP(userID)
 	writeJSON(w, http.StatusForbidden, map[string]interface{}{
 		"error":          "totp_required",
@@ -1953,6 +2113,28 @@ func (sa *SecureAuth) userHasPermission(userID, permission string) (bool, error)
 		}
 	}
 	return false, nil
+}
+
+// rolesOfUser returns the names of every role currently assigned to userID.
+func (sa *SecureAuth) rolesOfUser(userID string) ([]string, error) {
+	rows, err := sa.db.Query(
+		`SELECT r.name FROM `+tblRoles+` r
+		 JOIN `+tblUserRoles+` ur ON ur.role_id = r.id
+		 WHERE ur.user_id = ?`, userID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		out = append(out, name)
+	}
+	return out, rows.Err()
 }
 
 func (sa *SecureAuth) userHasRole(userID, role string) (bool, error) {
@@ -2105,29 +2287,31 @@ func (sa *SecureAuth) handleRegisterInit(w http.ResponseWriter, r *http.Request)
 	})
 }
 
-func (sa *SecureAuth) handleLoginInit(w http.ResponseWriter, r *http.Request) {
+// startLoginInit implements the OPAQUE KE1 -> KE2 leg for both login and
+// reauth flows. `purpose` is stored on the login-attempt row and validated
+// by the corresponding finish handler.
+func (sa *SecureAuth) startLoginInit(w http.ResponseWriter, r *http.Request, username, purpose string) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-
-	var req struct {
-		Username string `json:"username"`
-		KE1      string `json:"ke1"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "bad request", http.StatusBadRequest)
-		return
-	}
-	if req.Username == "" {
+	if username == "" {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
 
 	ip := sa.clientIP(r)
 	if !sa.rl.allow("login-init-ip:"+ip, 10, 1.0/60.0) ||
-		!sa.rl.allow("login-init-user:"+req.Username, 5, 1.0/60.0) {
+		!sa.rl.allow("login-init-user:"+username, 5, 1.0/60.0) {
 		http.Error(w, "rate limited", http.StatusTooManyRequests)
+		return
+	}
+
+	var req struct {
+		KE1 string `json:"ke1"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
 
@@ -2147,27 +2331,27 @@ func (sa *SecureAuth) handleLoginInit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	record, credID, err := sa.loadClientRecord(req.Username)
+	record, credID, err := sa.loadClientRecord(username)
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
 
-	// Fetch the stored per-user KSF salt. For a non-existent user, return a
-	// random salt so the response is indistinguishable from an existing user
-	// whose salt is also random. For legacy rows with NULL ksf_salt, fall
-	// back to 32 zero bytes (matches the pre-migration fixed-salt behaviour).
+	// Per-user KSF salt. For a non-existent user, return a deterministic
+	// fake salt derived from the master key so that repeated probes cannot
+	// distinguish real users (stable salt) from unknown users (also stable).
 	var ksfSalt []byte
 	err = sa.db.QueryRow(
-		`SELECT ksf_salt FROM `+tblUsers+` WHERE username = ?`, req.Username,
+		`SELECT ksf_salt FROM `+tblUsers+` WHERE username = ?`, username,
 	).Scan(&ksfSalt)
 	if err == sql.ErrNoRows {
-		ksfSalt = randomBytes(32)
+		ksfSalt = sa.fakeKSFSalt(username)
 	} else if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
 	if len(ksfSalt) == 0 {
+		// Legacy rows with NULL ksf_salt fall back to a fixed zero-salt.
 		ksfSalt = make([]byte, 32)
 	}
 
@@ -2183,11 +2367,11 @@ func (sa *SecureAuth) handleLoginInit(w http.ResponseWriter, r *http.Request) {
 	_, err = sa.db.Exec(
 		`INSERT INTO `+tblLoginAttempts+`
 		 (id, username, credential_id, client_mac, session_secret,
-		  transcript_hash, created_at, expires_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		attemptID, req.Username, credID,
+		  transcript_hash, created_at, expires_at, purpose)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		attemptID, username, credID,
 		output.ClientMAC, output.SessionSecret,
-		transcriptHash[:], time.Now().UTC(), expires,
+		transcriptHash[:], time.Now().UTC(), expires, purpose,
 	)
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
@@ -2199,6 +2383,53 @@ func (sa *SecureAuth) handleLoginInit(w http.ResponseWriter, r *http.Request) {
 		"ke2":            base64.StdEncoding.EncodeToString(ke2.Serialize()),
 		"ksfSalt":        base64.StdEncoding.EncodeToString(ksfSalt),
 	})
+}
+
+func (sa *SecureAuth) handleLoginInit(w http.ResponseWriter, r *http.Request) {
+	// We decode the body ourselves because startLoginInit expects the
+	// username to be pulled out separately.
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var envelope struct {
+		Username string `json:"username"`
+		KE1      string `json:"ke1"`
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxBodyBytes))
+	if err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	if err := json.Unmarshal(body, &envelope); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	// Rebuild the body for startLoginInit so it can re-parse the KE1.
+	r.Body = io.NopCloser(strings.NewReader(`{"ke1":"` + envelope.KE1 + `"}`))
+	sa.startLoginInit(w, r, envelope.Username, "login")
+}
+
+// handleReauthInit — POST /api/reauth/init
+//
+// Re-runs the OPAQUE KE1->KE2 leg against the current session's user. No
+// username comes from the body: re-auth is only ever for the caller.
+func (sa *SecureAuth) handleReauthInit(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	sess, err := sa.loadSessionInfo(r)
+	if err != nil {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	// Reject if the current session is not fully authenticated.
+	if sess.TOTPPending {
+		sa.respondTOTPRequired(w, sess.UserID)
+		return
+	}
+	sa.startLoginInit(w, r, sess.UserID, "reauth")
 }
 
 func (sa *SecureAuth) loadClientRecord(username string) (*opaque.ClientRecord, []byte, error) {
@@ -2242,7 +2473,10 @@ func (sa *SecureAuth) fakeCredentialID(username string) []byte {
 	return hmacSHA256(sa.masterKey, []byte("fake-cred-id:"+username))
 }
 
-func (sa *SecureAuth) handleLogin2(w http.ResponseWriter, r *http.Request) {
+// finishLogin2 implements the OPAQUE KE3 -> session leg. When purpose ==
+// "reauth" it issues a reauth token bound to the caller's user instead of a
+// new session cookie. In both cases the login-attempt row is consumed.
+func (sa *SecureAuth) finishLogin2(w http.ResponseWriter, r *http.Request, purpose string) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -2271,13 +2505,14 @@ func (sa *SecureAuth) handleLogin2(w http.ResponseWriter, r *http.Request) {
 		storedSecret   []byte
 		transcriptHash []byte
 		expires        time.Time
+		storedPurpose  string
 	)
 	err := sa.db.QueryRow(
 		`SELECT username, credential_id, client_mac, session_secret,
-		        transcript_hash, expires_at
+		        transcript_hash, expires_at, purpose
 		 FROM `+tblLoginAttempts+` WHERE id = ?`, req.LoginAttemptID,
-	).Scan(&username, &credID, &storedMAC, &storedSecret, &transcriptHash, &expires)
-	if err != nil {
+	).Scan(&username, &credID, &storedMAC, &storedSecret, &transcriptHash, &expires, &storedPurpose)
+	if err != nil || storedPurpose != purpose {
 		sa.genericAuthFailure(w)
 		return
 	}
@@ -2363,27 +2598,73 @@ func (sa *SecureAuth) handleLogin2(w http.ResponseWriter, r *http.Request) {
 		32,
 	)
 
+	// ---------------------------------------------------------------------
+	// Reauth branch: no new session, just a short-lived token.
+	// ---------------------------------------------------------------------
+	if purpose == "reauth" {
+		// Verify that the session that initiated the reauth is the same
+		// user we just authenticated as.
+		callerSess, err := sa.loadSessionInfo(r)
+		if err != nil || callerSess.UserID != username {
+			sa.genericAuthFailure(w)
+			return
+		}
+		token, err := sa.issueReauthToken(username)
+		if err != nil {
+			http.Error(w, "internal error", http.StatusInternalServerError)
+			return
+		}
+		sa.appendAudit(username, "reauth", "", "allow", ip, "")
+		writeJSON(w, http.StatusOK, map[string]string{
+			"reauthToken": token,
+		})
+		return
+	}
+
+	// ---------------------------------------------------------------------
+	// Login branch: create a session.
+	// ---------------------------------------------------------------------
 	sessionKeyEnc, err := sa.seal(sessionKey, aadSessionKey)
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
 
-	// Check if user has TOTP enabled — if so, the session starts as pending.
 	totpEnabled, err := sa.userHasTOTP(username)
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
-	// Also check whether 2FA is enforced but not yet set up (first login).
-	totpRequired := totpEnabled || (sa.require2FA)
+
+	// Bootstrap special case.
+	//
+	// During first-run bootstrap, the auto-created admin's very first
+	// session must not be gated on TOTP: the client has not yet been
+	// shown a provisioning URI, so it cannot complete TOTP setup before
+	// the bootstrap flow needs to commit wrapped masterkeys.
+	//
+	// We only exempt the specific user named in the unconsumed bootstrap
+	// record, and only while the record remains unconsumed. Once
+	// /api/bootstrap/first-user commits (consumed = 1), the flag flips
+	// and every subsequent session — including this admin's next login —
+	// goes through the normal TOTP path.
+	isBootstrapAdmin := false
+	{
+		var consumed int
+		var bUser string
+		err := sa.db.QueryRow(
+			`SELECT consumed, username FROM `+tblBootstrap+` WHERE id = 1`,
+		).Scan(&consumed, &bUser)
+		if err == nil && consumed == 0 && bUser == username {
+			isBootstrapAdmin = true
+		}
+	}
+
+	totpRequired := totpEnabled || (sa.require2FA && !isBootstrapAdmin)
 	totpPendingInt := 0
 	if totpEnabled {
 		totpPendingInt = 1
-	}
-	// If 2FA is enforced but not yet configured, the session is also
-	// "pending" — the user must set up 2FA before accessing anything else.
-	if sa.require2FA && !totpEnabled {
+	} else if sa.require2FA && !isBootstrapAdmin {
 		totpPendingInt = 1
 	}
 
@@ -2425,6 +2706,15 @@ func (sa *SecureAuth) handleLogin2(w http.ResponseWriter, r *http.Request) {
 		"totpRequired":             totpRequired,
 		"totpConfigured":           totpEnabled,
 	})
+}
+
+func (sa *SecureAuth) handleLogin2(w http.ResponseWriter, r *http.Request) {
+	sa.finishLogin2(w, r, "login")
+}
+
+// handleReauthFinish — POST /api/reauth/finish
+func (sa *SecureAuth) handleReauthFinish(w http.ResponseWriter, r *http.Request) {
+	sa.finishLogin2(w, r, "reauth")
 }
 
 func (sa *SecureAuth) genericAuthFailure(w http.ResponseWriter) {
@@ -2498,9 +2788,6 @@ func (sa *SecureAuth) handleLogout(w http.ResponseWriter, r *http.Request) {
 // User management
 // ---------------------------------------------------------------------------
 
-// createUserRequest accepts either a single legacy `role` string or a
-// `roles` array. If both are present, `roles` wins and `role` is ignored.
-// At least one role must be supplied.
 type createUserRequest struct {
 	Username               string   `json:"username"`
 	Role                   string   `json:"role,omitempty"`
@@ -2535,8 +2822,6 @@ func (sa *SecureAuth) handleCreateUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Resolve the effective role set. Prefer the new `roles` array; fall
-	// back to the legacy single `role` string for backward compatibility.
 	roleNames := req.Roles
 	if len(roleNames) == 0 && req.Role != "" {
 		roleNames = []string{req.Role}
@@ -2745,13 +3030,7 @@ func (sa *SecureAuth) handleGetUsers(w http.ResponseWriter, r *http.Request) {
 }
 
 // updateUserRequest accepts either a legacy single `newRole` string or a
-// `newRoles` array. If both are present, `newRoles` wins and `newRole` is
-// ignored. An empty (or absent) role field means "leave roles unchanged".
-//
-// It intentionally has no NewUsername field: renaming a user would
-// invalidate the OPAQUE envelope (bound to the client identity), so the
-// library forbids it. Unknown JSON fields (including newUsername) are
-// ignored by encoding/json.
+// `newRoles` array. KDF-info fields are preserved across credential resets.
 type updateUserRequest struct {
 	UserID                 string   `json:"userId"`
 	NewRole                string   `json:"newRole,omitempty"`
@@ -2761,9 +3040,11 @@ type updateUserRequest struct {
 	EncryptedRSAPrivateKey string   `json:"encrypted_rsa_private_key,omitempty"`
 	PrivateKeyNonce        string   `json:"private_key_nonce,omitempty"`
 	PrivateKeySalt         string   `json:"private_key_salt,omitempty"`
+	PrivateKeyKDFInfo      string   `json:"private_key_kdf_info,omitempty"`
 	EncryptedRSASigningKey string   `json:"encrypted_rsa_signing_private_key,omitempty"`
 	SigningKeyNonce        string   `json:"signing_key_nonce,omitempty"`
 	SigningKeySalt         string   `json:"signing_key_salt,omitempty"`
+	SigningKeyKDFInfo      string   `json:"signing_key_kdf_info,omitempty"`
 	KSFSalt                string   `json:"ksf_salt,omitempty"`
 }
 
@@ -2772,10 +3053,105 @@ func (sa *SecureAuth) handleUpdateUser(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	sess := sessionFrom(r)
+	if sess == nil {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
 	var req updateUserRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
+	}
+
+	// Credential-changing operations.
+	credentialChange := req.PendingRegID != "" ||
+		req.RegistrationRecord != "" ||
+		req.EncryptedRSAPrivateKey != "" ||
+		req.EncryptedRSASigningKey != ""
+
+	// Role-changing operations (either the plural or legacy singular field).
+	requestedRoles := req.NewRoles
+	if len(requestedRoles) == 0 && req.NewRole != "" {
+		requestedRoles = []string{req.NewRole}
+	}
+	roleChange := len(requestedRoles) > 0
+
+	// Both credential changes and role changes are security-sensitive:
+	// require a fresh re-authentication token for either.
+	if credentialChange || roleChange {
+		reauthToken := r.Header.Get("X-Reauth-Token")
+		if !sa.checkReauthToken(sess.UserID, reauthToken) {
+			sa.appendAudit(sess.UserID, "user.update", req.UserID, "deny",
+				sa.clientIP(r), "reauth required")
+			http.Error(w, "re-authentication required", http.StatusForbidden)
+			return
+		}
+		defer sa.consumeReauthToken(sess.UserID, reauthToken)
+	}
+
+	// Role-hierarchy enforcement: a non-SuperAdmin caller may only add or
+	// remove roles it already holds. This prevents an Admin from promoting
+	// itself (or anyone else) to SuperAdmin, and prevents an Admin from
+	// demoting a SuperAdmin.
+	callerIsSuper, err := sa.userHasRole(sess.UserID, "SuperAdmin")
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	if !callerIsSuper && roleChange {
+		callerRoles, err := sa.rolesOfUser(sess.UserID)
+		if err != nil {
+			http.Error(w, "internal error", http.StatusInternalServerError)
+			return
+		}
+		callerSet := make(map[string]struct{}, len(callerRoles))
+		for _, rn := range callerRoles {
+			callerSet[rn] = struct{}{}
+		}
+
+		targetRoles, err := sa.rolesOfUser(req.UserID)
+		if err != nil {
+			http.Error(w, "internal error", http.StatusInternalServerError)
+			return
+		}
+		targetSet := make(map[string]struct{}, len(targetRoles))
+		for _, rn := range targetRoles {
+			targetSet[rn] = struct{}{}
+		}
+
+		requestedSet := make(map[string]struct{}, len(requestedRoles))
+		for _, rn := range requestedRoles {
+			requestedSet[rn] = struct{}{}
+		}
+
+		// Every role the caller is trying to *grant* must already be held.
+		for rn := range requestedSet {
+			if _, ok := callerSet[rn]; !ok {
+				sa.appendAudit(sess.UserID, "user.update", req.UserID, "deny",
+					sa.clientIP(r), "attempted to grant unheld role: "+rn)
+				http.Error(w,
+					"forbidden: cannot grant a role you do not already hold",
+					http.StatusForbidden)
+				return
+			}
+		}
+		// Every role the caller is trying to *revoke* must also be held.
+		for rn := range targetSet {
+			if _, held := callerSet[rn]; held {
+				continue
+			}
+			if _, stillWanted := requestedSet[rn]; stillWanted {
+				continue
+			}
+			sa.appendAudit(sess.UserID, "user.update", req.UserID, "deny",
+				sa.clientIP(r), "attempted to revoke unheld role: "+rn)
+			http.Error(w,
+				"forbidden: cannot revoke a role you do not already hold",
+				http.StatusForbidden)
+			return
+		}
 	}
 
 	now := time.Now().UTC()
@@ -2836,15 +3212,15 @@ func (sa *SecureAuth) handleUpdateUser(w http.ResponseWriter, r *http.Request) {
 			`UPDATE `+tblUsers+` SET
 			 opaque_registration_record = ?,
 			 encrypted_rsa_private_key = ?, private_key_nonce = ?,
-			 private_key_salt = ?,
+			 private_key_salt = ?, private_key_kdf_info = ?,
 			 encrypted_rsa_signing_private_key = ?, signing_key_nonce = ?,
-			 signing_key_salt = ?,
+			 signing_key_salt = ?, signing_key_kdf_info = ?,
 			 ksf_salt = ?,
 			 updated_at = ?
 			 WHERE username = ?`,
 			recBytes,
-			encPriv, nonce, salt,
-			signEncPriv, signNonce, signSalt,
+			encPriv, nonce, salt, req.PrivateKeyKDFInfo,
+			signEncPriv, signNonce, signSalt, req.SigningKeyKDFInfo,
 			ksfSalt,
 			now, req.UserID,
 		)
@@ -2855,16 +3231,9 @@ func (sa *SecureAuth) handleUpdateUser(w http.ResponseWriter, r *http.Request) {
 		_ = credID
 	}
 
-	// Resolve the effective role set. Prefer the new `newRoles` array;
-	// fall back to the legacy single `newRole` string. An empty result
-	// means "leave roles unchanged".
-	roleNames := req.NewRoles
-	if len(roleNames) == 0 && req.NewRole != "" {
-		roleNames = []string{req.NewRole}
-	}
-	if len(roleNames) > 0 {
+	if len(requestedRoles) > 0 {
 		_, _ = tx.Exec(`DELETE FROM `+tblUserRoles+` WHERE user_id = ?`, req.UserID)
-		for _, roleName := range roleNames {
+		for _, roleName := range requestedRoles {
 			roleID := "role-" + roleName
 			_, _ = tx.Exec(
 				`INSERT OR IGNORE INTO `+tblUserRoles+` (user_id, role_id) VALUES (?, ?)`,
@@ -2883,8 +3252,7 @@ func (sa *SecureAuth) handleUpdateUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	actor := auditActor(r, "")
-	sa.appendAudit(actor, "user.update", req.UserID, "allow", sa.clientIP(r), "")
+	sa.appendAudit(sess.UserID, "user.update", req.UserID, "allow", sa.clientIP(r), "")
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
@@ -2956,6 +3324,30 @@ func (sa *SecureAuth) handleShareKeys(w http.ResponseWriter, r *http.Request) {
 	).Scan(&targetPub)
 	if err != nil {
 		http.Error(w, "target user not found", http.StatusNotFound)
+		return
+	}
+
+	// Structural sanity check: the wrapped blob must be exactly one
+	// RSA-OAEP ciphertext under the target user's modulus. Without this, a
+	// malicious admin can sign an arbitrary blob and permanently lock the
+	// target user out of the authorization.
+	targetPubAny, err := x509.ParsePKIXPublicKey(targetPub)
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	targetRSA, ok := targetPubAny.(*rsa.PublicKey)
+	if !ok {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	expectedLen := (targetRSA.N.BitLen() + 7) / 8
+	if len(wrapped) != expectedLen {
+		sa.appendAudit(sess.UserID, "sharekeys.write", req.AuthorizationID,
+			"deny", sa.clientIP(r),
+			fmt.Sprintf("wrapped key length %d != expected %d", len(wrapped), expectedLen))
+		http.Error(w, "wrapped key length does not match target RSA modulus",
+			http.StatusBadRequest)
 		return
 	}
 
@@ -3047,11 +3439,6 @@ func (sa *SecureAuth) handleGetWrappedMasterkey(w http.ResponseWriter, r *http.R
 		return
 	}
 
-	// Accept role permission OR an active shared key. The per-resource
-	// authorizations created by the host application (auth-client-*,
-	// auth-fiche-*) are never linked to any role — the shared key itself
-	// is the grant. Requiring role permission would lock every normal
-	// user out of their own content.
 	roleOK, err := sa.userHasPermission(sess.UserID, authName)
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
@@ -3182,9 +3569,6 @@ func (sa *SecureAuth) handleUpdateRole(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Revoke any shared key whose (user, authorization) is no longer backed
-	// by a role grant. This handles authorization removals from the updated
-	// role, and any other stale rows as a side effect.
 	if err := revokeStaleSharedKeysTx(tx, now); err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
@@ -3347,9 +3731,6 @@ func (sa *SecureAuth) userHasActiveKey(userID, authorizationID string) bool {
 	return count > 0
 }
 
-// checkDataAccess verifies that the session user both has the permission the
-// authorization grants and holds a non-revoked shared key for it. Returns
-// (authName, true) on success.
 func (sa *SecureAuth) checkDataAccess(sess *sessionInfo, authID string) (string, bool) {
 	authName, err := sa.authorizationName(authID)
 	if err != nil {
@@ -3413,8 +3794,6 @@ func (sa *SecureAuth) handleDataPut(w http.ResponseWriter, r *http.Request, sess
 	}
 	defer tx.Rollback()
 
-	// Reject cross-authorization overwrite: if a row with this id already
-	// exists, its authorization_id must match the request.
 	var existingAuthID string
 	err = tx.QueryRow(
 		`SELECT authorization_id FROM `+tblEncryptedData+` WHERE id = ?`, id,
@@ -3594,6 +3973,24 @@ func (sa *SecureAuth) handleBootstrapCredentials(w http.ResponseWriter, r *http.
 		return
 	}
 
+	// The bootstrap password is a one-shot admin secret. Restrict its
+	// disclosure to loopback: on a fresh deployment an attacker who can
+	// reach the server before the legitimate operator would otherwise
+	// win the race and provision their own SuperAdmin account. Operators
+	// who expose the service on a public interface must retrieve the
+	// first-run credentials from the server log instead.
+	ip := sa.clientIP(r)
+	host, _, err := net.SplitHostPort(ip)
+	if err != nil {
+		host = ip
+	}
+	if parsed := net.ParseIP(host); parsed == nil || !parsed.IsLoopback() {
+		sa.appendAudit("", "bootstrap.credentials", "", "deny", ip,
+			"non-loopback source")
+		writeJSON(w, http.StatusOK, map[string]interface{}{"available": false})
+		return
+	}
+
 	notAvailable := func() {
 		writeJSON(w, http.StatusOK, map[string]interface{}{"available": false})
 	}
@@ -3608,7 +4005,7 @@ func (sa *SecureAuth) handleBootstrapCredentials(w http.ResponseWriter, r *http.
 	var username string
 	var sealedPwd []byte
 	var consumed int
-	err := sa.db.QueryRow(
+	err = sa.db.QueryRow(
 		`SELECT username, sealed_password, consumed FROM `+tblBootstrap+` WHERE id = 1`,
 	).Scan(&username, &sealedPwd, &consumed)
 	if err != nil || consumed != 0 {
@@ -3621,6 +4018,8 @@ func (sa *SecureAuth) handleBootstrapCredentials(w http.ResponseWriter, r *http.
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
+
+	sa.appendAudit("", "bootstrap.credentials", "", "allow", ip, "")
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"available":      true,
@@ -3879,15 +4278,6 @@ func (sa *SecureAuth) handleIndex(w http.ResponseWriter, r *http.Request) {
 
 	importMap := `<script type="importmap" nonce="` + nonce + `">` + importMapJSON() + `</script>`
 
-	// Inline guard for the login page: this is a classic (non-module) script,
-	// so it runs synchronously at parse time and does not depend on the
-	// module graph loading successfully. It unconditionally cancels the
-	// first submission of the login form, so that if the real handler in
-	// the module script ever fails to attach (blocked import, CDN outage,
-	// extension interference, JS exception during module init, ...), the
-	// browser still cannot fall back to a native form submission that would
-	// put the password in the URL bar. When the module script does load, its
-	// own submit handler runs after this one and performs the actual login.
 	guardScript := ""
 	if page == "/login" || page == "/" {
 		guardScript = `<script nonce="` + nonce + `">` +
@@ -3902,8 +4292,6 @@ func (sa *SecureAuth) handleIndex(w http.ResponseWriter, r *http.Request) {
 			`</script>`
 	}
 
-	// Boot: import the module and start init(). Expose the resulting promise
-	// on window.__sa_ready so the per-page script can await it.
 	bootScript := `<script type="module" nonce="` + nonce + `">` +
 		`import { SecureAuth } from "/static/secureauth.mjs"; ` +
 		`window.SecureAuth = SecureAuth; ` +
@@ -3914,7 +4302,6 @@ func (sa *SecureAuth) handleIndex(w http.ResponseWriter, r *http.Request) {
 	pageScript := ""
 	if body, ok := pageScripts[page]; ok && body != "" {
 		pageScript = `<script type="module" nonce="` + nonce + `">` + body + `</script>`
-		// Substitute the return endpoint in any page that redirects on success.
 		switch page {
 		case "/login", "/", "/2fa/setup", "/2fa/verify":
 			pageScript = strings.Replace(pageScript, "{loginReturnEndpoint}", sa.loginReturnEndpoint, 1)
@@ -3946,14 +4333,9 @@ func importMapJSON() string {
 }
 
 // ---------------------------------------------------------------------------
-// Per-page module scripts (injected after the boot script)
-//
-// These are raw Go strings; no backticks. They run with top-level await
-// after SecureAuth.init() has resolved.
+// Per-page module scripts
 // ---------------------------------------------------------------------------
 
-// sharedShellScript adds a nav bar to non-login pages. Prepended to users,
-// roles, and authorizations page scripts.
 const sharedShellScript = `
 (function () {
   var nav = document.createElement("nav");
@@ -3999,11 +4381,7 @@ var loginPageScript = `
 })();
 `
 
-// usersPageScript now supports multi-role selection on both create and edit.
-// The wrapper createUserMulti works around the underlying single-role
-// SecureAuth.createUser by creating the user with the first role and then
-// immediately calling updateUser with the full set.
-const usersPageScript = sharedShellScript + `
+var usersPageScript = sharedShellScript + `
 (function () {
   var sa = window.SecureAuth;
   var root = document.querySelector("#out");
@@ -4013,7 +4391,6 @@ const usersPageScript = sharedShellScript + `
   }
   root.innerHTML = "";
 
-  // Multi-role wrapper around the single-role SecureAuth.createUser.
   var _origCreate = sa.createUser.bind(sa);
   async function createUserMulti(username, password, roles) {
     if (!Array.isArray(roles)) roles = [roles];
@@ -4025,7 +4402,6 @@ const usersPageScript = sharedShellScript + `
     }
   }
 
-  // --- create user ---
   var createForm = document.createElement("form");
   createForm.innerHTML =
     '<h3>Create user</h3>' +
@@ -4053,7 +4429,6 @@ const usersPageScript = sharedShellScript + `
   });
   root.appendChild(createForm);
 
-  // --- table ---
   var table = document.createElement("table");
   table.border = "1";
   table.style.borderCollapse = "collapse";
@@ -4065,7 +4440,6 @@ const usersPageScript = sharedShellScript + `
   table.appendChild(tbody);
   root.appendChild(table);
 
-  // --- edit panel ---
   var editPanel = document.createElement("div");
   editPanel.style.marginTop = "12px";
   root.appendChild(editPanel);
@@ -4135,6 +4509,8 @@ const usersPageScript = sharedShellScript + `
         '<label><input type="checkbox" name="newRoles" value="SuperAdmin"' + checked("SuperAdmin") + '> SuperAdmin</label>' +
       '</fieldset> ' +
       '<label>New password: <input name="password" type="password" placeholder="(unchanged)"></label> ' +
+      '<label>Your password (required for any role or credential change): ' +
+        '<input name="reauthPassword" type="password" placeholder="your password"></label> ' +
       '<button>Save</button> <button type="button" id="sa-cancel">Cancel</button>';
     form.addEventListener("submit", async function (e) {
       e.preventDefault();
@@ -4150,8 +4526,11 @@ const usersPageScript = sharedShellScript + `
       var np = fd.get("password");
       if (np) changes.password = np;
       if (Object.keys(changes).length === 0) { editPanel.innerHTML = ""; return; }
+
+      var rp = fd.get("reauthPassword");
+      if (!rp) { alert("Enter your password to authorise this change"); return; }
       try {
-        await sa.updateUser(u.username, changes);
+        await sa.updateUser(u.username, changes, { reauthPassword: rp });
         editPanel.innerHTML = "";
         refresh();
       } catch (err) {
@@ -4426,7 +4805,7 @@ func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 }
 
 // ---------------------------------------------------------------------------
-// Built-in default templates
+// Built-in default templates (unchanged except where noted)
 // ---------------------------------------------------------------------------
 
 const defaultCSS = `
@@ -4743,8 +5122,6 @@ const defaultAuthorizationsHTML = `<!doctype html>
 </body>
 </html>`
 
-// SetTOTPSetupPageTemplate lets the host override the 2FA setup page.
-// The template must contain {totpsetupjs}.
 func (sa *SecureAuth) SetTOTPSetupPageTemplate(tpl string) error {
 	if err := validateTemplate("totpsetup", tpl); err != nil {
 		return err
@@ -4757,8 +5134,6 @@ func (sa *SecureAuth) SetTOTPSetupPageTemplate(tpl string) error {
 	return nil
 }
 
-// SetTOTPVerifyPageTemplate lets the host override the 2FA verification page.
-// The template must contain {totpverifyjs}.
 func (sa *SecureAuth) SetTOTPVerifyPageTemplate(tpl string) error {
 	if err := validateTemplate("totpverify", tpl); err != nil {
 		return err
@@ -4771,10 +5146,6 @@ func (sa *SecureAuth) SetTOTPVerifyPageTemplate(tpl string) error {
 	return nil
 }
 
-// installDefaultTemplates wires up the built-in fallback pages. It is called
-// from Init so that a host application can use SecureAuth without calling
-// any Set*PageTemplate method. Hosts that do call them will simply override
-// the defaults.
 func (sa *SecureAuth) installDefaultTemplates() error {
 	if err := sa.SetLoginPageTemplate(defaultLoginHTML); err != nil {
 		return err
@@ -4798,11 +5169,9 @@ func (sa *SecureAuth) installDefaultTemplates() error {
 }
 
 // ---------------------------------------------------------------------------
-// TOTP guard script (shared between setup and verify pages)
+// TOTP page scripts
 // ---------------------------------------------------------------------------
 
-// The loginReturnEndpoint substitution also covers the TOTP verify page so it
-// knows where to go after successful verification.
 const totpVerifyPageScript = `
 (function () {
   var form = document.querySelector("form#f");
@@ -4827,7 +5196,6 @@ const totpVerifyPageScript = `
 
 const totpSetupPageScript = `
 (function () {
-  // Step 1: load the QR + secret from the server.
   async function beginSetup() {
     if (window.__sa_ready) await window.__sa_ready;
     try {
@@ -4836,7 +5204,6 @@ const totpSetupPageScript = `
       var uriEl = document.querySelector("#sa-uri");
       var secEl = document.querySelector("#sa-secret");
       if (qrDiv) {
-  // Show the URI immediately as a fallback so the page is never blank.
   qrDiv.innerHTML =
     "<a href=\"" + data.provisioningUri +
     "\" style=\"word-break:break-all;font-size:12px\">" +
@@ -4855,7 +5222,6 @@ const totpSetupPageScript = `
       });
     }
 
-    // typeNumber 0 = auto-size, 'M' = ~15% error correction (standard for otpauth).
     var qr = window.qrcode(0, "M");
     qr.addData(data.provisioningUri);
     qr.make();
@@ -4882,12 +5248,10 @@ const totpSetupPageScript = `
     qrDiv.appendChild(canvas);
   } catch (err) {
     console.error("2FA QR render failed:", err);
-    // Fallback URI is already on screen; nothing else to do.
   }
 }
       if (uriEl) uriEl.textContent = data.provisioningUri;
       if (secEl) secEl.textContent = data.secret;
-      // Store challenge data for the finish step.
       window.__sa2faData = data;
     } catch (err) {
       var out = document.querySelector("#out");
@@ -4896,7 +5260,6 @@ const totpSetupPageScript = `
   }
   beginSetup();
 
-  // Step 2: handle the confirmation form.
   var form = document.querySelector("form#f");
   var out = document.querySelector("#out");
   if (form) {
@@ -4917,10 +5280,6 @@ const totpSetupPageScript = `
   }
 })();
 `
-
-// ---------------------------------------------------------------------------
-// Default TOTP HTML pages
-// ---------------------------------------------------------------------------
 
 const defaultTOTPVerifyHTML = `<!doctype html>
 <html lang="en">

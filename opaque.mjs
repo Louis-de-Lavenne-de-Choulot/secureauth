@@ -530,7 +530,14 @@ export async function opaqueFinishLogin({
     state.blind,
     ptFrom(evaluatedBytes),
   );
-  const ksfSalt = options.ksfSalt ?? state.ksfSalt ?? randomBytes(Nh);
+  const ksfSalt = options.ksfSalt ?? state.ksfSalt;
+  if (!ksfSalt || ksfSalt.length === 0) {
+    throw new Error(
+      "opaqueFinishLogin: no KSF salt available — the server must " +
+        "return ksfSalt from /api/login/init and it must be passed " +
+        "through options.ksfSalt or state.ksfSalt",
+    );
+  }
   const ksfLen = options.ksfLength ?? state.ksfLength;
   const ksfParams = options.ksfParams ?? state.ksfParams;
   const stretched = opaqueStretch(oprfOutput, ksfSalt, ksfLen, ksfParams);
