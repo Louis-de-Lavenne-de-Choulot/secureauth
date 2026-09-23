@@ -1683,7 +1683,7 @@ func (sa *SecureAuth) wrap(next http.HandlerFunc, needsCSRF bool) http.HandlerFu
 		if r.Body != nil {
 			r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
 		}
-		if err := requireTLS(r); err != nil {
+		if r.TLS == nil && r.Header.Get("X-Forwarded-Proto") != "https" {
 			http.Error(w, "HTTPS required", http.StatusForbidden)
 			return
 		}
