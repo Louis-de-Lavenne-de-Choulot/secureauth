@@ -67,6 +67,80 @@ const state = {
 // Primitive helpers (exported for downstream applications)
 // ===========================================================================
 
+// Loads and imports the RSA-OAEP + RSA-PSS keys from /api/privatekey.
+// `exportKey` is the OPAQUE export key that unlocks the encrypted PKCS#8
+// blobs; it is not zeroised here — the caller owns its lifetime.
+async function loadAndImportPrivateKeys(exportKey) {
+  const blob = await jsonFetch("/api/privatekey");
+
+  const salt = b64decode(blob.private_key_salt);
+  const nonce = b64decode(blob.private_key_nonce);
+  const ciphertext = b64decode(blob.encrypted_rsa_private_key);
+  const info = utf8(blob.private_key_kdf_info || "SecureAuth RSA private key");
+  const kPriv = hkdfSha256(exportKey, salt, info, 32);
+  const plaintextPriv = xchacha20poly1305(kPriv, nonce).decrypt(ciphertext);
+
+  state.rsaPrivateKeyPkcs8 = new Uint8Array(plaintextPriv);
+  state.rsaPrivateKey = await crypto.subtle.importKey(
+    "pkcs8",
+    plaintextPriv,
+    { name: "RSA-OAEP", hash: "SHA-256" },
+    false,
+    ["decrypt"],
+  );
+
+  let kSign = null,
+    sPlain = null;
+  if (blob.encrypted_rsa_signing_private_key) {
+    const sSalt = b64decode(blob.signing_key_salt);
+    const sNonce = b64decode(blob.signing_key_nonce);
+    const sCt = b64decode(blob.encrypted_rsa_signing_private_key);
+    const sInfo = utf8(
+      blob.signing_key_kdf_info || "SecureAuth RSA signing private key",
+    );
+    kSign = hkdfSha256(exportKey, sSalt, sInfo, 32);
+    sPlain = xchacha20poly1305(kSign, sNonce).decrypt(sCt);
+
+    state.rsaSigningKeyPkcs8 = new Uint8Array(sPlain);
+    state.rsaSigningKey = await crypto.subtle.importKey(
+      "pkcs8",
+      sPlain,
+      { name: "RSA-PSS", hash: "SHA-256" },
+      false,
+      ["sign"],
+    );
+  }
+
+  try {
+    const users = await jsonFetch("/api/getusers", {});
+    const me = (users.users || []).find((u) => u.username === state.userID);
+    if (me) {
+      state.rsaPublicKey = await crypto.subtle.importKey(
+        "spki",
+        b64decode(me.rsa_public_key),
+        { name: "RSA-OAEP", hash: "SHA-256" },
+        true,
+        ["encrypt"],
+      );
+    }
+  } catch {
+    /* user.read may not be granted */
+  }
+
+  zeroise(kPriv, plaintextPriv, kSign, sPlain);
+}
+
+async function completePendingTotpLogin() {
+  const exportKey = state.pendingExportKey;
+  if (!exportKey) return;
+  state.pendingExportKey = null;
+  try {
+    await loadAndImportPrivateKeys(exportKey);
+  } finally {
+    zeroise(exportKey);
+  }
+}
+
 export function assertSecureContext() {
   if (typeof window !== "undefined" && !window.isSecureContext) {
     throw new Error("SecureAuth requires a secure context (HTTPS).");
@@ -212,7 +286,12 @@ function opaqueStartReg(clientState, password) {
   return opaqueStartRegistration(clientState, utf8(password));
 }
 
-function opaqueFinishReg(clientState, registrationResponseBytes, username, ksfSalt) {
+function opaqueFinishReg(
+  clientState,
+  registrationResponseBytes,
+  username,
+  ksfSalt,
+) {
   const { record, exportKey } = opaqueFinishRegistration(
     clientState,
     registrationResponseBytes,
@@ -232,7 +311,12 @@ function opaqueStartLog(clientState, password) {
   return opaqueStartLogin(clientState, utf8(password));
 }
 
-async function opaqueFinishLog(loginResponseBytes, clientState, username, ksfSalt) {
+async function opaqueFinishLog(
+  loginResponseBytes,
+  clientState,
+  username,
+  ksfSalt,
+) {
   const encoder = new TextEncoder();
   return await opaqueFinishLogin({
     state: clientState,
@@ -526,63 +610,27 @@ export const SecureAuth = {
     state.sessionId = step2.sessionId;
     state.userID = username;
 
-    const blob = await jsonFetch("/api/privatekey");
-
-    const salt = b64decode(blob.private_key_salt);
-    const nonce = b64decode(blob.private_key_nonce);
-    const ciphertext = b64decode(blob.encrypted_rsa_private_key);
-    const info = utf8(blob.private_key_kdf_info || "SecureAuth RSA private key");
-    const kPriv = hkdfSha256(exportKey, salt, info, 32);
-    const plaintextPriv = xchacha20poly1305(kPriv, nonce).decrypt(ciphertext);
-
-    state.rsaPrivateKeyPkcs8 = new Uint8Array(plaintextPriv);
-    state.rsaPrivateKey = await crypto.subtle.importKey(
-      "pkcs8",
-      plaintextPriv,
-      { name: "RSA-OAEP", hash: "SHA-256" },
-      false,
-      ["decrypt"],
-    );
-
-    if (blob.encrypted_rsa_signing_private_key) {
-      const sSalt = b64decode(blob.signing_key_salt);
-      const sNonce = b64decode(blob.signing_key_nonce);
-      const sCt = b64decode(blob.encrypted_rsa_signing_private_key);
-      const sInfo = utf8(
-        blob.signing_key_kdf_info || "SecureAuth RSA signing private key",
-      );
-      const kSign = hkdfSha256(exportKey, sSalt, sInfo, 32);
-      const sPlain = xchacha20poly1305(kSign, sNonce).decrypt(sCt);
-
-      state.rsaSigningKeyPkcs8 = new Uint8Array(sPlain);
-      state.rsaSigningKey = await crypto.subtle.importKey(
-        "pkcs8",
-        sPlain,
-        { name: "RSA-PSS", hash: "SHA-256" },
-        false,
-        ["sign"],
-      );
-      zeroise(kSign, sPlain);
+    if (step2.totpRequired) {
+      // Server marked this session totp_pending. /api/privatekey would 403.
+      // Keep the OPAQUE export key around so we can decrypt the RSA blobs
+      // after the user completes the second factor.
+      state.pendingExportKey = exportKey; // NOT zeroised — it's now owned by state
+      zeroise(sessionKey, clientEphPriv, macKey);
+      return {
+        sessionId: state.sessionId,
+        totpRequired: true,
+        totpConfigured: !!step2.totpConfigured,
+      };
     }
 
-    try {
-      const users = await jsonFetch("/api/getusers", {});
-      const me = (users.users || []).find((u) => u.username === username);
-      if (me) {
-        state.rsaPublicKey = await crypto.subtle.importKey(
-          "spki",
-          b64decode(me.rsa_public_key),
-          { name: "RSA-OAEP", hash: "SHA-256" },
-          true,
-          ["encrypt"],
-        );
-      }
-    } catch {
-      /* user.read may not be granted */
-    }
+    await loadAndImportPrivateKeys(exportKey);
+    zeroise(exportKey, sessionKey, clientEphPriv, macKey);
 
-    zeroise(exportKey, sessionKey, kPriv, plaintextPriv, clientEphPriv, macKey);
-    return { sessionId: state.sessionId };
+    return {
+      sessionId: state.sessionId,
+      totpRequired: false,
+      totpConfigured: !!step2.totpConfigured,
+    };
   },
 
   // -------------------------------------------------------------------------
@@ -592,6 +640,8 @@ export const SecureAuth = {
     try {
       await jsonFetch("/logout", { __csrf: false });
     } finally {
+      zeroise(state.pendingExportKey);
+      state.pendingExportKey = null;
       zeroise(state.sessionKeyRaw);
       zeroise(state.rsaPrivateKeyPkcs8, state.rsaSigningKeyPkcs8);
       state.sessionKeyRaw = null;
@@ -960,6 +1010,57 @@ export const SecureAuth = {
   // an out-of-band channel instead of the auto-bootstrap path.
   setBootstrapToken(token) {
     state.bootstrapToken = token;
+  },
+
+  // -------------------------------------------------------------------------
+  // 2FA / TOTP methods
+  // -------------------------------------------------------------------------
+
+  // get2faStatus() — returns { enabled, required, configured }
+  async get2faStatus() {
+    return jsonFetch("/api/2fa/status");
+  },
+
+  // begin2faSetup() — starts TOTP enrollment.
+  // Returns { challengeId, provisioningUri, secret, sealedSecret }
+  // The caller should display provisioningUri as a QR code and ask the user
+  // to scan it, then call finish2faSetup() with the confirmation code.
+  async begin2faSetup() {
+    return jsonFetch("/api/2fa/setup/begin", {});
+  },
+
+  // finish2faSetup(setupData, code) — confirms TOTP enrollment.
+  // setupData is the object returned by begin2faSetup().
+  // code is the 6-digit code from the authenticator app.
+  async finish2faSetup(setupData, code) {
+    const cleanCode = (code || "").replace(/\s/g, "");
+    const result = await jsonFetch("/api/2fa/setup/finish", {
+      challengeId: setupData.challengeId,
+      sealedSecret: setupData.sealedSecret,
+      code: cleanCode,
+    });
+    await completePendingTotpLogin();
+    return result;
+  },
+
+  // verify2fa(code) — verifies a TOTP code for a session that is totp_pending.
+  // Must be called after login() when totpRequired is true and totpConfigured
+  // is also true. On success the session becomes fully authenticated.
+  async verify2fa(code) {
+    const cleanCode = (code || "").replace(/\s/g, "");
+    const result = await jsonFetch("/api/2fa/verify", { code: cleanCode });
+    await completePendingTotpLogin();
+    return result;
+  },
+
+  // disable2fa(code) — disables TOTP for the current user.
+  // Requires the user's current authenticator code as confirmation.
+  // Will throw if 2FA is enforced server-side (Require2FA: true).
+  async disable2fa(code) {
+    const cleanCode = (code || "").replace(/\s/g, "");
+    const result = await jsonFetch("/api/2fa/disable", { code: cleanCode });
+    await completePendingTotpLogin();
+    return result;
   },
 };
 

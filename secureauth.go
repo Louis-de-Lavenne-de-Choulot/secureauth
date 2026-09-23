@@ -6,12 +6,15 @@ import (
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/sha1"
 	"crypto/sha256"
 	"crypto/subtle"
 	"crypto/x509"
 	"database/sql"
 	_ "embed"
+	"encoding/base32"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -19,8 +22,10 @@ import (
 	"html/template"
 	"io"
 	"log"
+	"math"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -43,6 +48,9 @@ var secureAuthJS string
 //go:embed opaque.mjs
 var opaqueJS string
 
+//go:embed qrcode-generator.js
+var qrcodeGeneratorJS string
+
 var (
 	aadOPAQUEKey  = []byte("secureauth:opaque-server-key-material:v1")
 	aadSessionKey = []byte("secureauth:session-key:v1")
@@ -57,6 +65,8 @@ type InitOptions struct {
 	TLSCertificate []byte
 	TrustedProxies []string
 	Debug          bool
+	Require2FA     bool // if true, users must set up TOTP before accessing anything
+	TOTPIssuer     string
 }
 
 type SecureAuth struct {
@@ -68,10 +78,13 @@ type SecureAuth struct {
 	tlsEndPoint    []byte
 	bootstrapToken []byte
 	debug          bool
+	require2FA     bool
+	totpIssuer     string
 
 	trustedProxies []*net.IPNet
 
 	tplLogin, tplUsers, tplRoles, tplAuthorizations *template.Template
+	tplTOTPSetup, tplTOTPVerify                     *template.Template
 
 	rl          *rateLimiter
 	auditMu     sync.Mutex
@@ -102,6 +115,7 @@ const (
 	tblPendingRegs    = "_secureauth_pending_regs_9f3a"
 	tblEncryptedData  = "_secureauth_encrypted_data_9f3a"
 	tblBootstrap      = "_secureauth_bootstrap_9f3a"
+	tblTOTPChallenges = "_secureauth_totp_challenges_9f3a"
 )
 
 // ---------------------------------------------------------------------------
@@ -130,6 +144,7 @@ func Init(dbdriver string, dsn string, opts InitOptions) (*SecureAuth, error) {
 		loginAttemptTTL: 2 * time.Minute,
 		rl:              newRateLimiter(),
 		debug:           opts.Debug,
+		require2FA:      opts.Require2FA,
 	}
 	sa.masterKey = make([]byte, 32)
 	copy(sa.masterKey, opts.MasterKey)
@@ -139,6 +154,12 @@ func Init(dbdriver string, dsn string, opts InitOptions) (*SecureAuth, error) {
 	} else {
 		sa.serverID = []byte("secureauth")
 	}
+
+	issuer := opts.TOTPIssuer
+	if issuer == "" {
+		issuer = string(sa.serverID)
+	}
+	sa.totpIssuer = sanitizeTOTPIssuer(issuer)
 
 	for _, cidr := range opts.TrustedProxies {
 		_, netw, err := net.ParseCIDR(cidr)
@@ -367,6 +388,12 @@ func (sa *SecureAuth) createTables() error {
 			consumed INTEGER NOT NULL DEFAULT 0,
 			created_at TIMESTAMP NOT NULL
 		)`,
+		`CREATE TABLE IF NOT EXISTS ` + tblTOTPChallenges + ` (
+			id TEXT PRIMARY KEY,
+			session_id TEXT NOT NULL,
+			created_at TIMESTAMP NOT NULL,
+			expires_at TIMESTAMP NOT NULL
+		)`,
 	}
 	for _, s := range stmts {
 		if _, err := sa.db.Exec(s); err != nil {
@@ -384,6 +411,11 @@ func (sa *SecureAuth) createTables() error {
 		`ALTER TABLE ` + tblUsers + ` ADD COLUMN ksf_salt BLOB`,
 		`ALTER TABLE ` + tblSessions + ` ADD COLUMN paake_transcript_hash BLOB`,
 		`ALTER TABLE ` + tblServerKeys + ` ADD COLUMN opaque_server_key_material BLOB`,
+		// TOTP columns on users table
+		`ALTER TABLE ` + tblUsers + ` ADD COLUMN totp_secret BLOB`,
+		`ALTER TABLE ` + tblUsers + ` ADD COLUMN totp_enabled INTEGER NOT NULL DEFAULT 0`,
+		// 2FA pending flag on sessions (set after password but before TOTP)
+		`ALTER TABLE ` + tblSessions + ` ADD COLUMN totp_pending INTEGER NOT NULL DEFAULT 0`,
 	}
 	for _, m := range migrations {
 		_, _ = sa.db.Exec(m)
@@ -667,6 +699,12 @@ func revokeStaleSharedKeysTx(tx *sql.Tx, now time.Time) error {
 	_, err := tx.Exec(`
 		UPDATE `+tblSharedKeys+` SET revoked_at = ?, revocation_reason = 'permissions changed'
 		WHERE revoked_at IS NULL
+		  -- Only consider keys whose authorization is actually role-granted.
+		  AND EXISTS (
+			SELECT 1 FROM `+tblRoleAuth+` ra
+			WHERE ra.authorization_id = `+tblSharedKeys+`.authorization_id
+		  )
+		  -- ...and revoke only if the user no longer holds any role that grants it.
 		  AND NOT EXISTS (
 			SELECT 1 FROM `+tblRoleAuth+` ra
 			JOIN `+tblUserRoles+` ur ON ur.role_id = ra.role_id
@@ -1006,6 +1044,424 @@ func (sa *SecureAuth) UserExists(username string) (bool, error) {
 }
 
 // ---------------------------------------------------------------------------
+// TOTP (RFC 6238 / RFC 4226) — pure-stdlib implementation
+// ---------------------------------------------------------------------------
+
+// totpGenerateSecret creates a random 20-byte TOTP secret and seals it with
+// the server master key before storage.
+func (sa *SecureAuth) totpGenerateSecret() (raw []byte, sealed []byte, err error) {
+	raw = randomBytes(20)
+	sealed, err = sa.seal(raw, []byte("secureauth:totp-secret:v1"))
+	return
+}
+
+// totpOpenSecret decrypts a sealed TOTP secret.
+func (sa *SecureAuth) totpOpenSecret(sealed []byte) ([]byte, error) {
+	return sa.open(sealed, []byte("secureauth:totp-secret:v1"))
+}
+
+// totpHOTP implements RFC 4226.
+func totpHOTP(secret []byte, counter uint64, digits int) string {
+	msg := make([]byte, 8)
+	binary.BigEndian.PutUint64(msg, counter)
+	mac := hmac.New(sha1.New, secret)
+	mac.Write(msg)
+	h := mac.Sum(nil)
+	offset := h[len(h)-1] & 0x0f
+	code := binary.BigEndian.Uint32(h[offset:offset+4]) & 0x7fffffff
+	d := uint32(math.Pow10(digits))
+	return fmt.Sprintf("%0*d", digits, code%d)
+}
+
+// totpVerify checks the provided 6-digit code against the secret, accepting
+// a window of ±1 step (30s) to tolerate clock skew.
+func totpVerify(secret []byte, code string, t time.Time) bool {
+	if len(code) != 6 {
+		return false
+	}
+	step := uint64(t.Unix() / 30)
+	for _, s := range []uint64{step - 1, step, step + 1} {
+		if subtle.ConstantTimeCompare([]byte(totpHOTP(secret, s, 6)), []byte(code)) == 1 {
+			return true
+		}
+	}
+	return false
+}
+
+// SetTOTPIssuer overrides the display name shown by authenticator apps for
+// this server. Call it once at startup, before serving requests — it is not
+// synchronised and concurrent calls would race.
+//
+// An empty string restores the default (ServerID).
+func (sa *SecureAuth) SetTOTPIssuer(issuer string) {
+	if issuer == "" {
+		issuer = string(sa.serverID)
+	}
+	sa.totpIssuer = sanitizeTOTPIssuer(issuer)
+}
+
+// sanitizeTOTPIssuer removes characters that would break the otpauth://
+// label format. Google's key-uri spec uses ":" as the separator between the
+// issuer and the account name, so an unescaped colon in the issuer would
+// make authenticator apps show a truncated or garbled label.
+func sanitizeTOTPIssuer(issuer string) string {
+	issuer = strings.TrimSpace(issuer)
+	issuer = strings.ReplaceAll(issuer, ":", "")
+	if issuer == "" {
+		return "SecureAuth"
+	}
+	return issuer
+}
+
+// totpProvisioningURI returns an otpauth:// URI for QR code generation.
+func totpProvisioningURI(secret []byte, username, issuer string) string {
+	b32 := base32.StdEncoding.WithPadding(base32.StdPadding).EncodeToString(secret)
+	label := url.PathEscape(issuer + ":" + username)
+	v := url.Values{}
+	v.Set("secret", b32)
+	v.Set("issuer", issuer)
+	v.Set("algorithm", "SHA1")
+	v.Set("digits", "6")
+	v.Set("period", "30")
+	return "otpauth://totp/" + label + "?" + v.Encode()
+}
+
+// sessionIsTOTPPending reports whether the session has completed password auth
+// but is still waiting for TOTP verification.
+func (sa *SecureAuth) sessionIsTOTPPending(sessionID string) bool {
+	var pending int
+	_ = sa.db.QueryRow(
+		`SELECT totp_pending FROM `+tblSessions+` WHERE session_id = ?`, sessionID,
+	).Scan(&pending)
+	return pending == 1
+}
+
+// userHasTOTP reports whether the user has TOTP enabled.
+func (sa *SecureAuth) userHasTOTP(username string) (bool, error) {
+	var enabled int
+	err := sa.db.QueryRow(
+		`SELECT totp_enabled FROM `+tblUsers+` WHERE username = ?`, username,
+	).Scan(&enabled)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	return enabled == 1, err
+}
+
+// ---------------------------------------------------------------------------
+// 2FA HTTP handlers  (served under /api/2fa/*)
+// ---------------------------------------------------------------------------
+
+// handleTOTPStatus — GET /api/2fa/status
+// Returns whether the current user has TOTP enabled.
+func (sa *SecureAuth) handleTOTPStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	sess, err := sa.loadSessionInfo(r)
+	if err != nil {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	enabled, err := sa.userHasTOTP(sess.UserID)
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"enabled":    enabled,
+		"required":   sa.require2FA,
+		"configured": enabled,
+	})
+}
+
+// handleTOTPSetupBegin — POST /api/2fa/setup/begin
+// Generates a fresh TOTP secret, seals it in a temporary challenge row,
+// and returns the provisioning URI + base32 secret for QR display.
+func (sa *SecureAuth) handleTOTPSetupBegin(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	sess, err := sa.loadSessionInfo(r)
+	if err != nil {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	// If 2FA is enforced and the session is still pending verification,
+	// we allow setup to proceed (that's the point of the redirect).
+	// But if there's an *existing* pending TOTP challenge, delete it first.
+	_, _ = sa.db.Exec(
+		`DELETE FROM `+tblTOTPChallenges+` WHERE session_id = ?`, sess.SessionID,
+	)
+
+	raw, sealed, err := sa.totpGenerateSecret()
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
+	challengeID := hex.EncodeToString(randomBytes(32))
+	_, err = sa.db.Exec(
+		`INSERT INTO `+tblTOTPChallenges+`
+		 (id, session_id, created_at, expires_at)
+		 VALUES (?, ?, ?, ?)`,
+		challengeID, sess.SessionID,
+		time.Now().UTC(), time.Now().Add(10*time.Minute).UTC(),
+	)
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
+	// Seal the temporary secret keyed to the challenge ID so it can't be
+	// replayed across sessions.
+	sealedForChallenge, err := sa.seal(sealed, []byte("secureauth:totp-setup-challenge:"+challengeID))
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
+	uri := totpProvisioningURI(raw, sess.UserID, sa.totpIssuer)
+	b32 := base32.StdEncoding.WithPadding(base32.StdPadding).EncodeToString(raw)
+
+	// Wipe plaintext secret from memory
+	for i := range raw {
+		raw[i] = 0
+	}
+
+	writeJSON(w, http.StatusOK, map[string]string{
+		"challengeId":     challengeID,
+		"provisioningUri": uri,
+		"secret":          b32,
+		"sealedSecret":    base64.StdEncoding.EncodeToString(sealedForChallenge),
+	})
+}
+
+// handleTOTPSetupFinish — POST /api/2fa/setup/finish
+// Verifies the user's first TOTP code, then persists the sealed secret
+// and marks totp_enabled = 1.
+func (sa *SecureAuth) handleTOTPSetupFinish(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	sess, err := sa.loadSessionInfo(r)
+	if err != nil {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	var req struct {
+		ChallengeID  string `json:"challengeId"`
+		SealedSecret string `json:"sealedSecret"`
+		Code         string `json:"code"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+
+	// Verify the challenge belongs to this session and is unexpired.
+	var storedSessionID string
+	var expires time.Time
+	err = sa.db.QueryRow(
+		`SELECT session_id, expires_at FROM `+tblTOTPChallenges+` WHERE id = ?`,
+		req.ChallengeID,
+	).Scan(&storedSessionID, &expires)
+	if err != nil || storedSessionID != sess.SessionID || time.Now().After(expires) {
+		http.Error(w, "invalid or expired challenge", http.StatusBadRequest)
+		return
+	}
+	_, _ = sa.db.Exec(`DELETE FROM `+tblTOTPChallenges+` WHERE id = ?`, req.ChallengeID)
+
+	// Unseal the temporary secret.
+	sealedForChallenge, err := base64.StdEncoding.DecodeString(req.SealedSecret)
+	if err != nil {
+		http.Error(w, "bad request: sealedSecret", http.StatusBadRequest)
+		return
+	}
+	innerSealed, err := sa.open(sealedForChallenge, []byte("secureauth:totp-setup-challenge:"+req.ChallengeID))
+	if err != nil {
+		http.Error(w, "bad request: cannot unseal secret", http.StatusBadRequest)
+		return
+	}
+	raw, err := sa.totpOpenSecret(innerSealed)
+	if err != nil {
+		http.Error(w, "bad request: cannot open secret", http.StatusBadRequest)
+		return
+	}
+	defer func() {
+		for i := range raw {
+			raw[i] = 0
+		}
+	}()
+
+	if !totpVerify(raw, req.Code, time.Now()) {
+		sa.appendAudit(sess.UserID, "2fa.setup", "", "deny", sa.clientIP(r), "invalid code")
+		http.Error(w, "invalid TOTP code", http.StatusUnauthorized)
+		return
+	}
+
+	// Persist the sealed secret and mark TOTP enabled. Also clear any
+	// totp_pending flag on the current session.
+	_, err = sa.db.Exec(
+		`UPDATE `+tblUsers+` SET totp_secret = ?, totp_enabled = 1 WHERE username = ?`,
+		innerSealed, sess.UserID,
+	)
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	_, _ = sa.db.Exec(
+		`UPDATE `+tblSessions+` SET totp_pending = 0 WHERE session_id = ?`, sess.SessionID,
+	)
+
+	sa.appendAudit(sess.UserID, "2fa.setup", "", "allow", sa.clientIP(r), "")
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+// handleTOTPVerify — POST /api/2fa/verify
+// Called immediately after login when the user has TOTP enabled (or when
+// they are redirected to /2fa/verify from a pending session).
+func (sa *SecureAuth) handleTOTPVerify(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	ip := sa.clientIP(r)
+	if !sa.rl.allow("2fa-verify:"+ip, 10, 1.0/60.0) {
+		http.Error(w, "rate limited", http.StatusTooManyRequests)
+		return
+	}
+
+	sess, err := sa.loadSessionInfo(r)
+	if err != nil {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	var req struct {
+		Code string `json:"code"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+
+	var sealedSecret []byte
+	err = sa.db.QueryRow(
+		`SELECT totp_secret FROM `+tblUsers+` WHERE username = ? AND totp_enabled = 1`,
+		sess.UserID,
+	).Scan(&sealedSecret)
+	if err != nil {
+		http.Error(w, "2FA not configured", http.StatusBadRequest)
+		return
+	}
+
+	raw, err := sa.totpOpenSecret(sealedSecret)
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	defer func() {
+		for i := range raw {
+			raw[i] = 0
+		}
+	}()
+
+	if !totpVerify(raw, req.Code, time.Now()) {
+		if !sa.rl.allow("2fa-fail:"+sess.UserID, 5, 1.0/120.0) {
+			// Too many failures: invalidate the session entirely.
+			_, _ = sa.db.Exec(`DELETE FROM `+tblSessions+` WHERE session_id = ?`, sess.SessionID)
+			http.SetCookie(w, &http.Cookie{
+				Name: "secureauth_session", Value: "", Path: "/", MaxAge: -1,
+				Secure: true, HttpOnly: true, SameSite: http.SameSiteLaxMode,
+			})
+			sa.appendAudit(sess.UserID, "2fa.verify", "", "deny", ip, "too many failures — session terminated")
+			http.Error(w, "too many failed attempts", http.StatusTooManyRequests)
+			return
+		}
+		sa.appendAudit(sess.UserID, "2fa.verify", "", "deny", ip, "invalid code")
+		http.Error(w, "invalid TOTP code", http.StatusUnauthorized)
+		return
+	}
+
+	_, _ = sa.db.Exec(
+		`UPDATE `+tblSessions+` SET totp_pending = 0 WHERE session_id = ?`, sess.SessionID,
+	)
+	sa.appendAudit(sess.UserID, "2fa.verify", "", "allow", ip, "")
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+// handleTOTPDisable — POST /api/2fa/disable
+// Disables TOTP for the authenticated user (requires a valid current code).
+func (sa *SecureAuth) handleTOTPDisable(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	sess, err := sa.loadSessionInfo(r)
+	if err != nil {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	// If 2FA is enforced server-side, nobody can disable it.
+	if sa.require2FA {
+		http.Error(w, "2FA is enforced and cannot be disabled", http.StatusForbidden)
+		return
+	}
+
+	var req struct {
+		Code string `json:"code"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+
+	var sealedSecret []byte
+	err = sa.db.QueryRow(
+		`SELECT totp_secret FROM `+tblUsers+` WHERE username = ? AND totp_enabled = 1`,
+		sess.UserID,
+	).Scan(&sealedSecret)
+	if err != nil {
+		http.Error(w, "2FA not configured", http.StatusBadRequest)
+		return
+	}
+	raw, err := sa.totpOpenSecret(sealedSecret)
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	defer func() {
+		for i := range raw {
+			raw[i] = 0
+		}
+	}()
+
+	if !totpVerify(raw, req.Code, time.Now()) {
+		sa.appendAudit(sess.UserID, "2fa.disable", "", "deny", sa.clientIP(r), "invalid code")
+		http.Error(w, "invalid TOTP code", http.StatusUnauthorized)
+		return
+	}
+
+	_, err = sa.db.Exec(
+		`UPDATE `+tblUsers+` SET totp_secret = NULL, totp_enabled = 0 WHERE username = ?`,
+		sess.UserID,
+	)
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
+	sa.appendAudit(sess.UserID, "2fa.disable", "", "allow", sa.clientIP(r), "")
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+// ---------------------------------------------------------------------------
 // HTTP plumbing
 // ---------------------------------------------------------------------------
 
@@ -1051,8 +1507,17 @@ func SecureAuthAndCommHandler(sa *SecureAuth, mux *http.ServeMux) http.Handler {
 	mux.HandleFunc("/api/bootstrap/masterkeys-pending", sa.wrap(sa.handleBootstrapMasterkeysPending, false))
 	mux.HandleFunc("/api/bootstrap/first-user", sa.wrap(sa.handleBootstrapFirstUser, true))
 
+	// 2FA endpoints — status and verify are accessible even with totp_pending
+	// sessions; setup/finish and disable require a fully-authenticated session.
+	mux.HandleFunc("/api/2fa/status", sa.wrap(sa.handleTOTPStatus, false))
+	mux.HandleFunc("/api/2fa/setup/begin", sa.wrap(sa.handleTOTPSetupBegin, true))
+	mux.HandleFunc("/api/2fa/setup/finish", sa.wrap(sa.handleTOTPSetupFinish, true))
+	mux.HandleFunc("/api/2fa/verify", sa.wrap(sa.handleTOTPVerify, true))
+	mux.HandleFunc("/api/2fa/disable", sa.wrap(sa.handleTOTPDisable, true))
+
 	mux.HandleFunc("/static/secureauth.mjs", sa.wrap(sa.handleServeSecureAuthJS, false))
 	mux.HandleFunc("/static/opaque.mjs", sa.wrap(sa.handleServeOpaqueJS, false))
+	mux.HandleFunc("/static/qrcode-generator.js", sa.wrap(sa.handleServeQRCodeGeneratorJS, false))
 	mux.HandleFunc("/", sa.wrap(sa.handleIndex, false))
 	return mux
 }
@@ -1288,11 +1753,12 @@ func sessionIDFromRequest(r *http.Request) string {
 // ---------------------------------------------------------------------------
 
 type sessionInfo struct {
-	SessionID string
-	UserID    string
-	Key       []byte
-	CSRF      string
-	ExpiresAt time.Time
+	SessionID   string
+	UserID      string
+	Key         []byte
+	CSRF        string
+	ExpiresAt   time.Time
+	TOTPPending bool // password auth done but TOTP not yet verified
 }
 
 func (sa *SecureAuth) loadSessionInfo(r *http.Request) (*sessionInfo, error) {
@@ -1301,15 +1767,16 @@ func (sa *SecureAuth) loadSessionInfo(r *http.Request) (*sessionInfo, error) {
 		return nil, errors.New("no session cookie")
 	}
 	var (
-		userID    string
-		keyCipher []byte
-		csrf      string
-		expires   time.Time
+		userID      string
+		keyCipher   []byte
+		csrf        string
+		expires     time.Time
+		totpPending int
 	)
 	err := sa.db.QueryRow(
-		`SELECT user_id, session_key_ciphertext, csrf_token, expires_at
+		`SELECT user_id, session_key_ciphertext, csrf_token, expires_at, totp_pending
 		 FROM `+tblSessions+` WHERE session_id = ?`, sid,
-	).Scan(&userID, &keyCipher, &csrf, &expires)
+	).Scan(&userID, &keyCipher, &csrf, &expires, &totpPending)
 	if err != nil {
 		return nil, err
 	}
@@ -1322,7 +1789,12 @@ func (sa *SecureAuth) loadSessionInfo(r *http.Request) (*sessionInfo, error) {
 		return nil, err
 	}
 	return &sessionInfo{
-		SessionID: sid, UserID: userID, Key: key, CSRF: csrf, ExpiresAt: expires,
+		SessionID:   sid,
+		UserID:      userID,
+		Key:         key,
+		CSRF:        csrf,
+		ExpiresAt:   expires,
+		TOTPPending: totpPending == 1,
 	}, nil
 }
 
@@ -1333,8 +1805,23 @@ func (sa *SecureAuth) loadSession(next func(http.ResponseWriter, *http.Request, 
 			http.Error(w, "unauthorized: "+err.Error(), http.StatusUnauthorized)
 			return
 		}
+		if sess.TOTPPending {
+			sa.respondTOTPRequired(w, sess.UserID)
+			return
+		}
 		next(w, r, sess)
 	}
+}
+
+// respondTOTPRequired writes the JSON envelope that the client uses to detect
+// that it must complete 2FA before proceeding.
+func (sa *SecureAuth) respondTOTPRequired(w http.ResponseWriter, userID string) {
+	// Check whether the user has TOTP configured or needs to set it up.
+	configured, _ := sa.userHasTOTP(userID)
+	writeJSON(w, http.StatusForbidden, map[string]interface{}{
+		"error":          "totp_required",
+		"totpConfigured": configured,
+	})
 }
 
 type sessionCtxKey struct{}
@@ -1354,6 +1841,10 @@ func (sa *SecureAuth) requirePermission(permission string, next http.HandlerFunc
 		if err != nil {
 			sa.appendAudit("", "authorize", permission, "deny", sa.clientIP(r), err.Error())
 			http.Error(w, "Forbidden", http.StatusForbidden)
+			return
+		}
+		if sess.TOTPPending {
+			sa.respondTOTPRequired(w, sess.UserID)
 			return
 		}
 		ok, err := sa.userHasPermission(sess.UserID, permission)
@@ -1878,6 +2369,24 @@ func (sa *SecureAuth) handleLogin2(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Check if user has TOTP enabled — if so, the session starts as pending.
+	totpEnabled, err := sa.userHasTOTP(username)
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	// Also check whether 2FA is enforced but not yet set up (first login).
+	totpRequired := totpEnabled || (sa.require2FA)
+	totpPendingInt := 0
+	if totpEnabled {
+		totpPendingInt = 1
+	}
+	// If 2FA is enforced but not yet configured, the session is also
+	// "pending" — the user must set up 2FA before accessing anything else.
+	if sa.require2FA && !totpEnabled {
+		totpPendingInt = 1
+	}
+
 	csrfToken, csrfCookie := sa.newCSRF(sessionID)
 	expiresAt := time.Now().Add(sa.sessionTTL)
 
@@ -1885,10 +2394,12 @@ func (sa *SecureAuth) handleLogin2(w http.ResponseWriter, r *http.Request) {
 		`INSERT INTO `+tblSessions+`
 		 (session_id, user_id, session_key_ciphertext, csrf_token,
 		  created_at, expires_at, paake_transcript_hash,
-		  client_ephemeral_public_key, server_ephemeral_public_key)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		  client_ephemeral_public_key, server_ephemeral_public_key,
+		  totp_pending)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		sessionID, username, sessionKeyEnc, csrfToken,
 		time.Now().UTC(), expiresAt, transcriptHash, clientEph, serverEphPub,
+		totpPendingInt,
 	)
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
@@ -1907,10 +2418,12 @@ func (sa *SecureAuth) handleLogin2(w http.ResponseWriter, r *http.Request) {
 	})
 
 	sa.appendAudit(username, "login2", "", "allow", ip, "")
-	writeJSON(w, http.StatusOK, map[string]string{
+	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"sessionId":                sessionID,
 		"serverEphemeralPublicKey": base64.StdEncoding.EncodeToString(serverEphPub),
 		"csrfToken":                csrfToken,
+		"totpRequired":             totpRequired,
+		"totpConfigured":           totpEnabled,
 	})
 }
 
@@ -3265,6 +3778,8 @@ var requiredPlaceholders = map[string]string{
 	"users":          "{usersjs}",
 	"roles":          "{rolesjs}",
 	"authorizations": "{authorizationsjs}",
+	"totpsetup":      "{totpsetupjs}",
+	"totpverify":     "{totpverifyjs}",
 }
 
 func validateTemplate(kind, tpl string) error {
@@ -3349,6 +3864,10 @@ func (sa *SecureAuth) handleIndex(w http.ResponseWriter, r *http.Request) {
 		t, ph = sa.tplRoles, "{rolesjs}"
 	case "/authorizations":
 		t, ph = sa.tplAuthorizations, "{authorizationsjs}"
+	case "/2fa/setup":
+		t, ph = sa.tplTOTPSetup, "{totpsetupjs}"
+	case "/2fa/verify":
+		t, ph = sa.tplTOTPVerify, "{totpverifyjs}"
 	default:
 		http.NotFound(w, r)
 		return
@@ -3395,7 +3914,9 @@ func (sa *SecureAuth) handleIndex(w http.ResponseWriter, r *http.Request) {
 	pageScript := ""
 	if body, ok := pageScripts[page]; ok && body != "" {
 		pageScript = `<script type="module" nonce="` + nonce + `">` + body + `</script>`
-		if page == "/login" || page == "/" {
+		// Substitute the return endpoint in any page that redirects on success.
+		switch page {
+		case "/login", "/", "/2fa/setup", "/2fa/verify":
 			pageScript = strings.Replace(pageScript, "{loginReturnEndpoint}", sa.loginReturnEndpoint, 1)
 		}
 	}
@@ -3460,10 +3981,16 @@ var loginPageScript = `
     out.textContent = "Signing in\u2026";
     try {
       if (window.__sa_ready) await window.__sa_ready;
-      await window.SecureAuth.login(fd.get("username"), fd.get("password"));
+      var result = await window.SecureAuth.login(fd.get("username"), fd.get("password"));
       sessionStorage.setItem("secureauth_logged_in", "1");
-      out.textContent = "Signed in. Redirecting\u2026";
-      setTimeout(function () { location.href = "{loginReturnEndpoint}"; }, 200);
+      if (result && result.totpRequired) {
+        out.textContent = "Redirecting to 2FA\u2026";
+        var dest = result.totpConfigured ? "/2fa/verify" : "/2fa/setup";
+        setTimeout(function () { location.href = dest; }, 200);
+      } else {
+        out.textContent = "Signed in. Redirecting\u2026";
+        setTimeout(function () { location.href = "{loginReturnEndpoint}"; }, 200);
+      }
     } catch (err) {
       console.error(err);
       out.textContent = "Login failed: " + err.message;
@@ -3869,6 +4396,8 @@ var pageScripts = map[string]string{
 	"/users":          usersPageScript,
 	"/roles":          rolesPageScript,
 	"/authorizations": authsPageScript,
+	"/2fa/setup":      totpSetupPageScript,
+	"/2fa/verify":     totpVerifyPageScript,
 }
 
 func (sa *SecureAuth) handleServeSecureAuthJS(w http.ResponseWriter, r *http.Request) {
@@ -3879,6 +4408,11 @@ func (sa *SecureAuth) handleServeSecureAuthJS(w http.ResponseWriter, r *http.Req
 func (sa *SecureAuth) handleServeOpaqueJS(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/javascript; charset=utf-8")
 	_, _ = io.WriteString(w, opaqueJS)
+}
+
+func (sa *SecureAuth) handleServeQRCodeGeneratorJS(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/javascript; charset=utf-8")
+	_, _ = io.WriteString(w, qrcodeGeneratorJS)
 }
 
 // ---------------------------------------------------------------------------
@@ -4209,6 +4743,34 @@ const defaultAuthorizationsHTML = `<!doctype html>
 </body>
 </html>`
 
+// SetTOTPSetupPageTemplate lets the host override the 2FA setup page.
+// The template must contain {totpsetupjs}.
+func (sa *SecureAuth) SetTOTPSetupPageTemplate(tpl string) error {
+	if err := validateTemplate("totpsetup", tpl); err != nil {
+		return err
+	}
+	t, err := template.New("totpsetup").Parse(tpl)
+	if err != nil {
+		return err
+	}
+	sa.tplTOTPSetup = t
+	return nil
+}
+
+// SetTOTPVerifyPageTemplate lets the host override the 2FA verification page.
+// The template must contain {totpverifyjs}.
+func (sa *SecureAuth) SetTOTPVerifyPageTemplate(tpl string) error {
+	if err := validateTemplate("totpverify", tpl); err != nil {
+		return err
+	}
+	t, err := template.New("totpverify").Parse(tpl)
+	if err != nil {
+		return err
+	}
+	sa.tplTOTPVerify = t
+	return nil
+}
+
 // installDefaultTemplates wires up the built-in fallback pages. It is called
 // from Init so that a host application can use SecureAuth without calling
 // any Set*PageTemplate method. Hosts that do call them will simply override
@@ -4226,5 +4788,209 @@ func (sa *SecureAuth) installDefaultTemplates() error {
 	if err := sa.SetAuthorizationsPageTemplate(defaultAuthorizationsHTML); err != nil {
 		return err
 	}
+	if err := sa.SetTOTPSetupPageTemplate(defaultTOTPSetupHTML); err != nil {
+		return err
+	}
+	if err := sa.SetTOTPVerifyPageTemplate(defaultTOTPVerifyHTML); err != nil {
+		return err
+	}
 	return nil
 }
+
+// ---------------------------------------------------------------------------
+// TOTP guard script (shared between setup and verify pages)
+// ---------------------------------------------------------------------------
+
+// The loginReturnEndpoint substitution also covers the TOTP verify page so it
+// knows where to go after successful verification.
+const totpVerifyPageScript = `
+(function () {
+  var form = document.querySelector("form#f");
+  var out = document.querySelector("#out");
+  if (!form) return;
+  form.addEventListener("submit", async function (e) {
+    e.preventDefault();
+    var fd = new FormData(form);
+    var code = (fd.get("code") || "").replace(/\s/g, "");
+    if (out) out.textContent = "Verifying\u2026";
+    try {
+      if (window.__sa_ready) await window.__sa_ready;
+      await window.SecureAuth.verify2fa(code);
+      if (out) out.textContent = "Verified. Redirecting\u2026";
+      setTimeout(function () { location.href = "{loginReturnEndpoint}"; }, 200);
+    } catch (err) {
+      if (out) out.textContent = "Error: " + err.message;
+    }
+  });
+})();
+`
+
+const totpSetupPageScript = `
+(function () {
+  // Step 1: load the QR + secret from the server.
+  async function beginSetup() {
+    if (window.__sa_ready) await window.__sa_ready;
+    try {
+      var data = await window.SecureAuth.begin2faSetup();
+      var qrDiv = document.querySelector("#sa-qr");
+      var uriEl = document.querySelector("#sa-uri");
+      var secEl = document.querySelector("#sa-secret");
+      if (qrDiv) {
+  // Show the URI immediately as a fallback so the page is never blank.
+  qrDiv.innerHTML =
+    "<a href=\"" + data.provisioningUri +
+    "\" style=\"word-break:break-all;font-size:12px\">" +
+    data.provisioningUri + "</a>";
+
+  try {
+    if (typeof window.qrcode === "undefined") {
+      await new Promise(function (resolve, reject) {
+        var s = document.createElement("script");
+        s.src = "/static/qrcode-generator.js";
+        s.onload = resolve;
+        s.onerror = function () {
+          reject(new Error("qrcode-generator.js failed to load"));
+        };
+        document.head.appendChild(s);
+      });
+    }
+
+    // typeNumber 0 = auto-size, 'M' = ~15% error correction (standard for otpauth).
+    var qr = window.qrcode(0, "M");
+    qr.addData(data.provisioningUri);
+    qr.make();
+
+    var count = qr.getModuleCount();
+    var cell  = Math.max(2, Math.floor(220 / count));
+    var side  = cell * count;
+
+    var canvas = document.createElement("canvas");
+    canvas.width  = side;
+    canvas.height = side;
+    var ctx = canvas.getContext("2d");
+    ctx.fillStyle = "#fff";
+    ctx.fillRect(0, 0, side, side);
+    ctx.fillStyle = "#000";
+    for (var r = 0; r < count; r++) {
+      for (var c = 0; c < count; c++) {
+        if (qr.isDark(r, c)) {
+          ctx.fillRect(c * cell, r * cell, cell, cell);
+        }
+      }
+    }
+    qrDiv.innerHTML = "";
+    qrDiv.appendChild(canvas);
+  } catch (err) {
+    console.error("2FA QR render failed:", err);
+    // Fallback URI is already on screen; nothing else to do.
+  }
+}
+      if (uriEl) uriEl.textContent = data.provisioningUri;
+      if (secEl) secEl.textContent = data.secret;
+      // Store challenge data for the finish step.
+      window.__sa2faData = data;
+    } catch (err) {
+      var out = document.querySelector("#out");
+      if (out) out.textContent = "Error loading setup: " + err.message;
+    }
+  }
+  beginSetup();
+
+  // Step 2: handle the confirmation form.
+  var form = document.querySelector("form#f");
+  var out = document.querySelector("#out");
+  if (form) {
+    form.addEventListener("submit", async function (e) {
+      e.preventDefault();
+      var fd = new FormData(form);
+      var code = (fd.get("code") || "").replace(/\s/g, "");
+      if (out) out.textContent = "Confirming\u2026";
+      try {
+        if (!window.__sa2faData) throw new Error("Setup not initialized");
+        await window.SecureAuth.finish2faSetup(window.__sa2faData, code);
+        if (out) out.textContent = "2FA enabled! Redirecting\u2026";
+        setTimeout(function () { location.href = "{loginReturnEndpoint}"; }, 800);
+      } catch (err) {
+        if (out) out.textContent = "Error: " + err.message;
+      }
+    });
+  }
+})();
+`
+
+// ---------------------------------------------------------------------------
+// Default TOTP HTML pages
+// ---------------------------------------------------------------------------
+
+const defaultTOTPVerifyHTML = `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Two-factor authentication · SecureAuth</title>
+<style>` + defaultCSS + `</style>
+</head>
+<body class="sa-auth-body">
+<main class="sa-auth-card">
+  <div class="sa-auth-brand">SecureAuth</div>
+  <h1>Two-factor authentication</h1>
+  <p class="sa-muted">Enter the 6-digit code from your authenticator app.</p>
+  <form id="f" method="post" action="/2fa/verify">
+    <label class="sa-field">
+      <span class="sa-label">Authenticator code</span>
+      <input name="code" inputmode="numeric" pattern="[0-9 ]*" autocomplete="one-time-code"
+             placeholder="000 000" required maxlength="7">
+    </label>
+    <button type="submit">Verify</button>
+  </form>
+  <pre id="out" class="sa-status"></pre>
+  <div class="sa-auth-foot">Lost access? Contact your administrator.</div>
+</main>
+{totpverifyjs}
+</body>
+</html>`
+
+const defaultTOTPSetupHTML = `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Set up two-factor authentication · SecureAuth</title>
+<style>` + defaultCSS + `
+#sa-qr { margin: 12px 0; min-height: 60px; }
+#sa-qr canvas { display: block; }
+.sa-code-box {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 13px;
+  background: var(--sa-surface-2);
+  border: 1px solid var(--sa-border);
+  border-radius: var(--sa-radius);
+  padding: 8px 12px;
+  word-break: break-all;
+  margin: 6px 0 14px;
+  user-select: all;
+}
+</style>
+</head>
+<body class="sa-auth-body">
+<main class="sa-auth-card" style="max-width:460px">
+  <div class="sa-auth-brand">SecureAuth</div>
+  <h1>Set up 2FA</h1>
+  <p class="sa-muted">Scan this QR code with any authenticator app (Google Authenticator, Authy, 1Password, etc.).</p>
+  <div id="sa-qr">Loading&hellip;</div>
+  <p style="margin:0 0 4px;font-size:13px;color:var(--sa-fg-muted)">Or enter this key manually:</p>
+  <div id="sa-secret" class="sa-code-box">&hellip;</div>
+  <p style="margin:0 0 14px;font-size:13px;color:var(--sa-fg-muted)">Then enter the 6-digit code to confirm setup.</p>
+  <form id="f" method="post" action="/2fa/setup/finish">
+    <label class="sa-field">
+      <span class="sa-label">Confirmation code</span>
+      <input name="code" inputmode="numeric" pattern="[0-9 ]*" autocomplete="one-time-code"
+             placeholder="000 000" required maxlength="7">
+    </label>
+    <button type="submit">Enable 2FA</button>
+  </form>
+  <pre id="out" class="sa-status"></pre>
+</main>
+{totpsetupjs}
+</body>
+</html>`
