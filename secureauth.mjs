@@ -1119,6 +1119,118 @@ export const SecureAuth = {
     return state.rsaPublicKey;
   },
 
+  // -------------------------------------------------------------------------
+  // Session handoff (pop-out windows)
+  //
+  // A pop-out window is a fresh renderer: same cookies, same partition, same
+  // OS user, but its own JS heap. It has no way to re-derive the RSA keypair
+  // because that derivation requires the OPAQUE export key, which is only
+  // produced during a login handshake and is zeroised immediately after use.
+  //
+  // These two methods let the primary window serialise the minimum state a
+  // sibling window needs to be usable, and let the sibling import it. They
+  // are hidden behind the SENSITIVE proxy in the same way as getMasterkey
+  // and currentRsaPrivateKey; only code that reads window.__saModule can
+  // reach them.
+  //
+  // What is NOT exported:
+  //   * masterkeyCache          — re-derivable on demand; omitting it keeps
+  //                               the payload small and short-lived.
+  //   * any CryptoKey object    — not serialisable; only the PKCS#8 bytes
+  //                               are shipped, and the receiver re-imports
+  //                               them with extractable=false.
+  // -------------------------------------------------------------------------
+  exportSession() {
+    if (!state.userID) return null;
+    if (!state.rsaPrivateKeyPkcs8) return null;
+    return {
+      userID: state.userID,
+      sessionId: state.sessionId || null,
+      sessionKeyRaw: state.sessionKeyRaw
+        ? b64encode(state.sessionKeyRaw)
+        : null,
+      rsaPrivateKeyPkcs8: b64encode(state.rsaPrivateKeyPkcs8),
+      rsaSigningKeyPkcs8: state.rsaSigningKeyPkcs8
+        ? b64encode(state.rsaSigningKeyPkcs8)
+        : null,
+    };
+  },
+
+  async importSession(payload) {
+    if (!payload || typeof payload !== "object") return false;
+    if (typeof payload.userID !== "string" || payload.userID.length === 0)
+      return false;
+    if (typeof payload.rsaPrivateKeyPkcs8 !== "string") return false;
+
+    // Import into locals first: never half-replace the module's state.
+    let newRsaKey, newRsaPkcs8;
+    try {
+      newRsaPkcs8 = b64decode(payload.rsaPrivateKeyPkcs8);
+      newRsaKey = await crypto.subtle.importKey(
+        "pkcs8",
+        newRsaPkcs8,
+        { name: "RSA-OAEP", hash: "SHA-256" },
+        false,
+        ["decrypt"],
+      );
+    } catch (e) {
+      return false;
+    }
+
+    let newSignKey = null,
+      newSignPkcs8 = null;
+    if (typeof payload.rsaSigningKeyPkcs8 === "string") {
+      try {
+        newSignPkcs8 = b64decode(payload.rsaSigningKeyPkcs8);
+        newSignKey = await crypto.subtle.importKey(
+          "pkcs8",
+          newSignPkcs8,
+          { name: "RSA-PSS", hash: "SHA-256" },
+          false,
+          ["sign"],
+        );
+      } catch {
+        newSignPkcs8 = null;
+        newSignKey = null; // signing is optional
+      }
+    }
+
+    // Commit.
+    zeroise(state.sessionKeyRaw);
+    zeroise(state.rsaPrivateKeyPkcs8, state.rsaSigningKeyPkcs8);
+    state.sessionKeyRaw =
+      typeof payload.sessionKeyRaw === "string"
+        ? b64decode(payload.sessionKeyRaw)
+        : null;
+    state.rsaPrivateKeyPkcs8 = newRsaPkcs8;
+    state.rsaPrivateKey = newRsaKey;
+    state.rsaSigningKeyPkcs8 = newSignPkcs8;
+    state.rsaSigningKey = newSignKey;
+    state.rsaPublicKey = null;
+    state.userID = payload.userID;
+    state.sessionId = payload.sessionId || null;
+
+    // Public key is re-fetched, unchanged from current behaviour.
+    try {
+      const users = await jsonFetch("/api/getusers", {});
+      const me = (users.users || []).find((u) => u.username === payload.userID);
+      if (me) {
+        state.rsaPublicKey = await crypto.subtle.importKey(
+          "spki",
+          b64decode(me.rsa_public_key),
+          { name: "RSA-OAEP", hash: "SHA-256" },
+          true,
+          ["encrypt"],
+        );
+      }
+    } catch {
+      /* user.read may not be granted */
+    }
+
+    state.initPromise = null;
+    return true;
+  },
+
   async ownRsaPublicKeyDer() {
     const pub = await ensureOwnRsaPublicKey();
     return new Uint8Array(await crypto.subtle.exportKey("spki", pub));
@@ -1192,12 +1304,19 @@ if (typeof window !== "undefined") {
     "currentRsaPrivateKey",
     "currentRsaSigningKey",
     "currentRsaPublicKey",
+    "exportSession",
+    "importSession",
   ]);
-	window.SecureAuth = new Proxy(SecureAuth, {
-		get(target, prop) {
-			if (typeof prop === "string" && SENSITIVE.has(prop)) return undefined;
-			const v = target[prop];
-			return typeof v === "function" ? v.bind(target) : v;
-		},
-	});
+
+  window.SecureAuth = new Proxy(SecureAuth, {
+    get(target, prop) {
+      if (typeof prop === "string" && SENSITIVE.has(prop)) return undefined;
+      const v = target[prop];
+      return typeof v === "function" ? v.bind(target) : v;
+    },
+  });
+
+  // Raw (un-proxied) reference used by session-lock.js for exportSession /
+  // importSession, which are intentionally hidden from window.SecureAuth.
+  window.__saModule = { SecureAuth };
 }
