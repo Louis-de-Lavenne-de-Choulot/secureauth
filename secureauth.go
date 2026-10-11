@@ -123,6 +123,10 @@ const (
 
 // ---------------------------------------------------------------------------
 // Init
+//
+// dbdriver must name a PostgreSQL database/sql driver. With the reference
+// integration (pgx v5 stdlib), pass "pgx" and import
+// _ "github.com/jackc/pgx/v5/stdlib" in the host program.
 // ---------------------------------------------------------------------------
 
 func Init(dbdriver string, dsn string, opts InitOptions) (*SecureAuth, error) {
@@ -226,18 +230,13 @@ func Init(dbdriver string, dsn string, opts InitOptions) (*SecureAuth, error) {
 		return nil, err
 	}
 
-	// Pre-populate the rate limiter from recent failed logins so a restart
-	// cannot be used to reset brute-force budgets.
 	sa.prepopulateRateLimiter()
 
-	// Background GC for short-lived rows.
 	go sa.gcExpiredRows()
 
 	return sa, nil
 }
 
-// Close stops the background GC goroutine. Optional; the process exit path
-// does not need to call it.
 func (sa *SecureAuth) Close() error {
 	select {
 	case <-sa.gcStop:
@@ -280,7 +279,7 @@ func (sa *SecureAuth) loadOrGenerateOPAQUEKeyMaterial() error {
 		return fmt.Errorf("secureauth: seal server key material: %w", err)
 	}
 	_, err = sa.db.Exec(
-		`UPDATE `+tblServerKeys+` SET opaque_server_key_material = ? WHERE id = 1`,
+		`UPDATE `+tblServerKeys+` SET opaque_server_key_material = $1 WHERE id = 1`,
 		sealed,
 	)
 	if err != nil {
@@ -293,36 +292,36 @@ func (sa *SecureAuth) createTables() error {
 	stmts := []string{
 		`CREATE TABLE IF NOT EXISTS ` + tblUsers + ` (
 			username TEXT PRIMARY KEY,
-			opaque_registration_record BLOB NOT NULL,
-			opaque_credential_id BLOB NOT NULL,
-			rsa_public_key BLOB NOT NULL,
-			encrypted_rsa_private_key BLOB NOT NULL,
-			private_key_nonce BLOB NOT NULL,
-			private_key_salt BLOB NOT NULL,
+			opaque_registration_record BYTEA NOT NULL,
+			opaque_credential_id BYTEA NOT NULL,
+			rsa_public_key BYTEA NOT NULL,
+			encrypted_rsa_private_key BYTEA NOT NULL,
+			private_key_nonce BYTEA NOT NULL,
+			private_key_salt BYTEA NOT NULL,
 			private_key_kdf_info TEXT,
-			rsa_signing_public_key BLOB,
-			encrypted_rsa_signing_private_key BLOB,
-			signing_key_nonce BLOB,
-			signing_key_salt BLOB,
+			rsa_signing_public_key BYTEA,
+			encrypted_rsa_signing_private_key BYTEA,
+			signing_key_nonce BYTEA,
+			signing_key_salt BYTEA,
 			signing_key_kdf_info TEXT,
-			ksf_salt BLOB,
-			created_at TIMESTAMP NOT NULL,
-			updated_at TIMESTAMP NOT NULL
+			ksf_salt BYTEA,
+			created_at TIMESTAMPTZ NOT NULL,
+			updated_at TIMESTAMPTZ NOT NULL
 		)`,
 		`CREATE TABLE IF NOT EXISTS ` + tblServerKeys + ` (
 			id INTEGER PRIMARY KEY CHECK (id = 1),
-			opaque_server_key_material BLOB,
-			created_at TIMESTAMP NOT NULL,
-			rotated_at TIMESTAMP
+			opaque_server_key_material BYTEA,
+			created_at TIMESTAMPTZ NOT NULL,
+			rotated_at TIMESTAMPTZ
 		)`,
 		`CREATE TABLE IF NOT EXISTS ` + tblSharedKeys + ` (
 			user_id TEXT NOT NULL,
 			authorization_id TEXT NOT NULL,
-			wrapped_key BLOB NOT NULL,
-			admin_signature BLOB NOT NULL,
+			wrapped_key BYTEA NOT NULL,
+			admin_signature BYTEA NOT NULL,
 			key_version INTEGER NOT NULL DEFAULT 1,
-			created_at TIMESTAMP NOT NULL,
-			revoked_at TIMESTAMP,
+			created_at TIMESTAMPTZ NOT NULL,
+			revoked_at TIMESTAMPTZ,
 			revocation_reason TEXT,
 			PRIMARY KEY (user_id, authorization_id, key_version)
 		)`,
@@ -349,73 +348,75 @@ func (sa *SecureAuth) createTables() error {
 		`CREATE TABLE IF NOT EXISTS ` + tblSessions + ` (
 			session_id TEXT PRIMARY KEY,
 			user_id TEXT NOT NULL,
-			session_key_ciphertext BLOB NOT NULL,
+			session_key_ciphertext BYTEA NOT NULL,
 			csrf_token TEXT NOT NULL,
-			created_at TIMESTAMP NOT NULL,
-			expires_at TIMESTAMP NOT NULL,
-			paake_transcript_hash BLOB,
-			client_ephemeral_public_key BLOB,
-			server_ephemeral_public_key BLOB
+			created_at TIMESTAMPTZ NOT NULL,
+			expires_at TIMESTAMPTZ NOT NULL,
+			paake_transcript_hash BYTEA,
+			client_ephemeral_public_key BYTEA,
+			server_ephemeral_public_key BYTEA,
+			totp_pending INTEGER NOT NULL DEFAULT 0
 		)`,
 		`CREATE TABLE IF NOT EXISTS ` + tblAudit + ` (
-			id INTEGER PRIMARY KEY AUTOINCREMENT,
-			timestamp TIMESTAMP NOT NULL,
+			id BIGSERIAL PRIMARY KEY,
+			timestamp TIMESTAMPTZ NOT NULL,
 			user_id TEXT,
 			action TEXT NOT NULL,
 			resource TEXT,
 			result TEXT NOT NULL,
 			ip_address TEXT,
 			details TEXT,
-			prev_hash BLOB,
-			entry_hash BLOB NOT NULL
+			prev_hash BYTEA,
+			entry_hash BYTEA NOT NULL
 		)`,
 		`CREATE TABLE IF NOT EXISTS ` + tblLoginAttempts + ` (
 			id TEXT PRIMARY KEY,
 			username TEXT NOT NULL,
-			credential_id BLOB NOT NULL,
-			client_mac BLOB NOT NULL,
-			session_secret BLOB NOT NULL,
-			transcript_hash BLOB NOT NULL,
-			created_at TIMESTAMP NOT NULL,
-			expires_at TIMESTAMP NOT NULL
+			credential_id BYTEA NOT NULL,
+			client_mac BYTEA NOT NULL,
+			session_secret BYTEA NOT NULL,
+			transcript_hash BYTEA NOT NULL,
+			created_at TIMESTAMPTZ NOT NULL,
+			expires_at TIMESTAMPTZ NOT NULL,
+			purpose TEXT NOT NULL DEFAULT 'login'
 		)`,
 		`CREATE TABLE IF NOT EXISTS ` + tblPendingRegs + ` (
 			id TEXT PRIMARY KEY,
 			username TEXT NOT NULL,
-			credential_id BLOB NOT NULL,
-			created_at TIMESTAMP NOT NULL,
-			expires_at TIMESTAMP NOT NULL
+			credential_id BYTEA NOT NULL,
+			created_at TIMESTAMPTZ NOT NULL,
+			expires_at TIMESTAMPTZ NOT NULL
 		)`,
 		`CREATE TABLE IF NOT EXISTS ` + tblEncryptedData + ` (
 			id TEXT PRIMARY KEY,
 			authorization_id TEXT NOT NULL,
 			owner_id TEXT NOT NULL,
 			key_version INTEGER NOT NULL DEFAULT 1,
-			nonce BLOB NOT NULL,
-			ciphertext BLOB NOT NULL,
+			nonce BYTEA NOT NULL,
+			ciphertext BYTEA NOT NULL,
 			label TEXT,
-			created_at TIMESTAMP NOT NULL,
-			updated_at TIMESTAMP NOT NULL
+			created_at TIMESTAMPTZ NOT NULL,
+			updated_at TIMESTAMPTZ NOT NULL
 		)`,
 		`CREATE TABLE IF NOT EXISTS ` + tblBootstrap + ` (
 			id INTEGER PRIMARY KEY CHECK (id = 1),
 			username TEXT NOT NULL,
-			sealed_password BLOB NOT NULL,
-			sealed_masterkeys BLOB,
+			sealed_password BYTEA NOT NULL,
+			sealed_masterkeys BYTEA,
 			consumed INTEGER NOT NULL DEFAULT 0,
-			created_at TIMESTAMP NOT NULL
+			created_at TIMESTAMPTZ NOT NULL
 		)`,
 		`CREATE TABLE IF NOT EXISTS ` + tblTOTPChallenges + ` (
 			id TEXT PRIMARY KEY,
 			session_id TEXT NOT NULL,
-			created_at TIMESTAMP NOT NULL,
-			expires_at TIMESTAMP NOT NULL
+			created_at TIMESTAMPTZ NOT NULL,
+			expires_at TIMESTAMPTZ NOT NULL
 		)`,
 		`CREATE TABLE IF NOT EXISTS ` + tblReauthTokens + ` (
 			token TEXT PRIMARY KEY,
 			user_id TEXT NOT NULL,
-			created_at TIMESTAMP NOT NULL,
-			expires_at TIMESTAMP NOT NULL,
+			created_at TIMESTAMPTZ NOT NULL,
+			expires_at TIMESTAMPTZ NOT NULL,
 			used INTEGER NOT NULL DEFAULT 0
 		)`,
 	}
@@ -425,32 +426,31 @@ func (sa *SecureAuth) createTables() error {
 		}
 	}
 
+	// Idempotent column additions for databases that predate a given
+	// column. PostgreSQL-specific IF NOT EXISTS; safe to rerun.
 	migrations := []string{
-		`ALTER TABLE ` + tblUsers + ` ADD COLUMN opaque_credential_id BLOB`,
-		`ALTER TABLE ` + tblUsers + ` ADD COLUMN rsa_signing_public_key BLOB`,
-		`ALTER TABLE ` + tblUsers + ` ADD COLUMN encrypted_rsa_signing_private_key BLOB`,
-		`ALTER TABLE ` + tblUsers + ` ADD COLUMN signing_key_nonce BLOB`,
-		`ALTER TABLE ` + tblUsers + ` ADD COLUMN signing_key_salt BLOB`,
-		`ALTER TABLE ` + tblUsers + ` ADD COLUMN signing_key_kdf_info TEXT`,
-		`ALTER TABLE ` + tblUsers + ` ADD COLUMN ksf_salt BLOB`,
-		`ALTER TABLE ` + tblSessions + ` ADD COLUMN paake_transcript_hash BLOB`,
-		`ALTER TABLE ` + tblServerKeys + ` ADD COLUMN opaque_server_key_material BLOB`,
-		// TOTP columns on users table
-		`ALTER TABLE ` + tblUsers + ` ADD COLUMN totp_secret BLOB`,
-		`ALTER TABLE ` + tblUsers + ` ADD COLUMN totp_enabled INTEGER NOT NULL DEFAULT 0`,
-		// Replay-protection: last TOTP step counter consumed by this user.
-		`ALTER TABLE ` + tblUsers + ` ADD COLUMN totp_last_step INTEGER NOT NULL DEFAULT 0`,
-		// 2FA pending flag on sessions (set after password but before TOTP)
-		`ALTER TABLE ` + tblSessions + ` ADD COLUMN totp_pending INTEGER NOT NULL DEFAULT 0`,
-		// Purpose column on login attempts (login vs reauth).
-		`ALTER TABLE ` + tblLoginAttempts + ` ADD COLUMN purpose TEXT NOT NULL DEFAULT 'login'`,
+		`ALTER TABLE ` + tblUsers + ` ADD COLUMN IF NOT EXISTS opaque_credential_id BYTEA`,
+		`ALTER TABLE ` + tblUsers + ` ADD COLUMN IF NOT EXISTS rsa_signing_public_key BYTEA`,
+		`ALTER TABLE ` + tblUsers + ` ADD COLUMN IF NOT EXISTS encrypted_rsa_signing_private_key BYTEA`,
+		`ALTER TABLE ` + tblUsers + ` ADD COLUMN IF NOT EXISTS signing_key_nonce BYTEA`,
+		`ALTER TABLE ` + tblUsers + ` ADD COLUMN IF NOT EXISTS signing_key_salt BYTEA`,
+		`ALTER TABLE ` + tblUsers + ` ADD COLUMN IF NOT EXISTS signing_key_kdf_info TEXT`,
+		`ALTER TABLE ` + tblUsers + ` ADD COLUMN IF NOT EXISTS ksf_salt BYTEA`,
+		`ALTER TABLE ` + tblSessions + ` ADD COLUMN IF NOT EXISTS paake_transcript_hash BYTEA`,
+		`ALTER TABLE ` + tblServerKeys + ` ADD COLUMN IF NOT EXISTS opaque_server_key_material BYTEA`,
+		`ALTER TABLE ` + tblUsers + ` ADD COLUMN IF NOT EXISTS totp_secret BYTEA`,
+		`ALTER TABLE ` + tblUsers + ` ADD COLUMN IF NOT EXISTS totp_enabled INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE ` + tblUsers + ` ADD COLUMN IF NOT EXISTS totp_last_step INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE ` + tblSessions + ` ADD COLUMN IF NOT EXISTS totp_pending INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE ` + tblLoginAttempts + ` ADD COLUMN IF NOT EXISTS purpose TEXT NOT NULL DEFAULT 'login'`,
 	}
 	for _, m := range migrations {
 		_, _ = sa.db.Exec(m)
 	}
 
 	_, _ = sa.db.Exec(
-		`INSERT OR IGNORE INTO `+tblServerKeys+` (id, created_at) VALUES (1, ?)`,
+		`INSERT INTO `+tblServerKeys+` (id, created_at) VALUES (1, $1)
+		 ON CONFLICT (id) DO NOTHING`,
 		time.Now().UTC(),
 	)
 	return nil
@@ -482,8 +482,10 @@ func (sa *SecureAuth) seedRoles() error {
 	for _, p := range presets {
 		roleID := "role-" + p.role
 		_, err := sa.db.Exec(
-			`INSERT OR IGNORE INTO `+tblRoles+` (id, name, description)
-			 VALUES (?, ?, ?)`, roleID, p.role, "Preset role "+p.role,
+			`INSERT INTO `+tblRoles+` (id, name, description)
+			 VALUES ($1, $2, $3)
+			 ON CONFLICT DO NOTHING`,
+			roleID, p.role, "Preset role "+p.role,
 		)
 		if err != nil {
 			return err
@@ -491,16 +493,20 @@ func (sa *SecureAuth) seedRoles() error {
 		for _, a := range p.authorizations {
 			authID := "auth-" + a
 			_, err = sa.db.Exec(
-				`INSERT OR IGNORE INTO `+tblAuthorizations+`
+				`INSERT INTO `+tblAuthorizations+`
 				 (id, name, description)
-				 VALUES (?, ?, ?)`, authID, a, "Preset authorization "+a,
+				 VALUES ($1, $2, $3)
+				 ON CONFLICT DO NOTHING`,
+				authID, a, "Preset authorization "+a,
 			)
 			if err != nil {
 				return err
 			}
 			_, err = sa.db.Exec(
-				`INSERT OR IGNORE INTO `+tblRoleAuth+` (role_id, authorization_id)
-				 VALUES (?, ?)`, roleID, authID,
+				`INSERT INTO `+tblRoleAuth+` (role_id, authorization_id)
+				 VALUES ($1, $2)
+				 ON CONFLICT DO NOTHING`,
+				roleID, authID,
 			)
 			if err != nil {
 				return err
@@ -524,10 +530,10 @@ func (sa *SecureAuth) maybeProvisionFirstAdmin() error {
 	_, _ = sa.db.Exec(`CREATE TABLE IF NOT EXISTS ` + tblBootstrap + ` (
 		id INTEGER PRIMARY KEY CHECK (id = 1),
 		username TEXT NOT NULL,
-		sealed_password BLOB NOT NULL,
-		sealed_masterkeys BLOB,
+		sealed_password BYTEA NOT NULL,
+		sealed_masterkeys BYTEA,
 		consumed INTEGER NOT NULL DEFAULT 0,
-		created_at TIMESTAMP NOT NULL
+		created_at TIMESTAMPTZ NOT NULL
 	)`)
 
 	var bsCount int
@@ -597,9 +603,15 @@ func (sa *SecureAuth) maybeProvisionFirstAdmin() error {
 	}
 
 	_, err = sa.db.Exec(
-		`INSERT OR REPLACE INTO `+tblBootstrap+`
+		`INSERT INTO `+tblBootstrap+`
 		 (id, username, sealed_password, sealed_masterkeys, consumed, created_at)
-		 VALUES (1, ?, ?, ?, 0, ?)`,
+		 VALUES (1, $1, $2, $3, 0, $4)
+		 ON CONFLICT (id) DO UPDATE SET
+		   username = EXCLUDED.username,
+		   sealed_password = EXCLUDED.sealed_password,
+		   sealed_masterkeys = EXCLUDED.sealed_masterkeys,
+		   consumed = EXCLUDED.consumed,
+		   created_at = EXCLUDED.created_at`,
 		username, sealedPwd, sealedMK, time.Now().UTC(),
 	)
 	if err != nil {
@@ -646,15 +658,10 @@ func (sa *SecureAuth) open(ciphertext, aad []byte) ([]byte, error) {
 	return aead.Open(nil, nonce, ct, aad)
 }
 
-// SealData encrypts plaintext with the server master key, binding it to aad.
-// The nonce is prepended to the ciphertext. Exposed so host applications can
-// protect at-rest data with the same root of trust SecureAuth uses for the
-// OPAQUE server key material and session keys.
 func (sa *SecureAuth) SealData(plaintext, aad []byte) ([]byte, error) {
 	return sa.seal(plaintext, aad)
 }
 
-// OpenData decrypts a blob produced by SealData.
 func (sa *SecureAuth) OpenData(ciphertext, aad []byte) ([]byte, error) {
 	return sa.open(ciphertext, aad)
 }
@@ -727,14 +734,14 @@ func (sa *SecureAuth) hasRegisteredUsers(ctx context.Context) (bool, error) {
 func (sa *SecureAuth) authorizationName(authID string) (string, error) {
 	var name string
 	err := sa.db.QueryRow(
-		`SELECT name FROM `+tblAuthorizations+` WHERE id = ?`, authID,
+		`SELECT name FROM `+tblAuthorizations+` WHERE id = $1`, authID,
 	).Scan(&name)
 	return name, err
 }
 
 func revokeStaleSharedKeysTx(tx *sql.Tx, now time.Time) error {
 	_, err := tx.Exec(`
-		UPDATE `+tblSharedKeys+` SET revoked_at = ?, revocation_reason = 'permissions changed'
+		UPDATE `+tblSharedKeys+` SET revoked_at = $1, revocation_reason = 'permissions changed'
 		WHERE revoked_at IS NULL
 		  AND EXISTS (
 			SELECT 1 FROM `+tblRoleAuth+` ra
@@ -753,47 +760,35 @@ func revokeStaleSharedKeysTx(tx *sql.Tx, now time.Time) error {
 // ClientIP / rate-limiter persistence
 // ---------------------------------------------------------------------------
 
-// ClientIP exposes SecureAuth's trusted-proxy–aware client IP resolution so
-// host applications can reuse the same logic (and, crucially, the same
-// X-Forwarded-For trust decisions) instead of reimplementing it.
 func (sa *SecureAuth) ClientIP(r *http.Request) string {
 	return sa.clientIP(r)
 }
 
-// fakeKSFSalt returns a deterministic, secret-derived salt for a username
-// that does not exist. Using a stable value (instead of a fresh random salt
-// per request) prevents an attacker from distinguishing real from
-// non-existent users by observing salt stability across probes.
 func (sa *SecureAuth) fakeKSFSalt(username string) []byte {
 	return hmacSHA256(sa.masterKey, []byte("fake-ksf-salt:"+username))
 }
 
-// prepopulateRateLimiter reads the audit log for recent failed login2
-// entries and installs zero-token buckets for those users, so that a restart
-// cannot be used to reset the per-user brute-force budget.
 func (sa *SecureAuth) prepopulateRateLimiter() {
 	since := time.Now().UTC().Add(-sa.loginAttemptTTL)
 	rows, err := sa.db.Query(
 		`SELECT DISTINCT user_id FROM `+tblAudit+`
-		 WHERE action = 'login2' AND result = 'deny' AND timestamp > ?`,
-		since.Format(time.RFC3339Nano),
+		 WHERE action = 'login2' AND result = 'deny' AND timestamp > $1`,
+		since,
 	)
 	if err != nil {
 		return
 	}
 	defer rows.Close()
 	for rows.Next() {
-		var uid string
-		if err := rows.Scan(&uid); err != nil || uid == "" {
+		var uid sql.NullString
+		if err := rows.Scan(&uid); err != nil || !uid.Valid || uid.String == "" {
 			continue
 		}
-		sa.rl.setTokens("login2-user:"+uid, 0)
-		sa.rl.setTokens("login-init-user:"+uid, 0)
+		sa.rl.setTokens("login2-user:"+uid.String, 0)
+		sa.rl.setTokens("login-init-user:"+uid.String, 0)
 	}
 }
 
-// gcExpiredRows periodically removes rows whose TTL has elapsed. Runs until
-// sa.gcStop is closed (via Close).
 func (sa *SecureAuth) gcExpiredRows() {
 	ticker := time.NewTicker(5 * time.Minute)
 	defer ticker.Stop()
@@ -803,15 +798,14 @@ func (sa *SecureAuth) gcExpiredRows() {
 			return
 		case <-ticker.C:
 			now := time.Now().UTC()
-			_, _ = sa.db.Exec(`DELETE FROM `+tblLoginAttempts+` WHERE expires_at < ?`, now)
-			_, _ = sa.db.Exec(`DELETE FROM `+tblTOTPChallenges+` WHERE expires_at < ?`, now)
-			_, _ = sa.db.Exec(`DELETE FROM `+tblPendingRegs+` WHERE expires_at < ?`, now)
+			_, _ = sa.db.Exec(`DELETE FROM `+tblLoginAttempts+` WHERE expires_at < $1`, now)
+			_, _ = sa.db.Exec(`DELETE FROM `+tblTOTPChallenges+` WHERE expires_at < $1`, now)
+			_, _ = sa.db.Exec(`DELETE FROM `+tblPendingRegs+` WHERE expires_at < $1`, now)
 			_, _ = sa.db.Exec(
-				`DELETE FROM `+tblReauthTokens+` WHERE expires_at < ? OR used = 1`,
+				`DELETE FROM `+tblReauthTokens+` WHERE expires_at < $1 OR used = 1`,
 				now,
 			)
-			// Sessions are cleaned lazily on access, but run a sweep too.
-			_, _ = sa.db.Exec(`DELETE FROM `+tblSessions+` WHERE expires_at < ?`, now)
+			_, _ = sa.db.Exec(`DELETE FROM `+tblSessions+` WHERE expires_at < $1`, now)
 		}
 	}
 }
@@ -836,7 +830,7 @@ func (sa *SecureAuth) RegisterAuthorization(id, name, description string) error 
 
 	var existingName string
 	errID := tx.QueryRow(
-		`SELECT name FROM `+tblAuthorizations+` WHERE id = ?`, id,
+		`SELECT name FROM `+tblAuthorizations+` WHERE id = $1`, id,
 	).Scan(&existingName)
 	switch {
 	case errID == nil:
@@ -849,7 +843,7 @@ func (sa *SecureAuth) RegisterAuthorization(id, name, description string) error 
 	case errID == sql.ErrNoRows:
 		var existingID string
 		errName := tx.QueryRow(
-			`SELECT id FROM `+tblAuthorizations+` WHERE name = ?`, name,
+			`SELECT id FROM `+tblAuthorizations+` WHERE name = $1`, name,
 		).Scan(&existingID)
 		if errName == nil {
 			return fmt.Errorf(
@@ -861,7 +855,7 @@ func (sa *SecureAuth) RegisterAuthorization(id, name, description string) error 
 			return fmt.Errorf("secureauth: RegisterAuthorization: lookup by name: %w", errName)
 		}
 		if _, err := tx.Exec(
-			`INSERT INTO `+tblAuthorizations+` (id, name, description) VALUES (?, ?, ?)`,
+			`INSERT INTO `+tblAuthorizations+` (id, name, description) VALUES ($1, $2, $3)`,
 			id, name, description,
 		); err != nil {
 			return fmt.Errorf("secureauth: insert authorization: %w", err)
@@ -905,7 +899,7 @@ func (sa *SecureAuth) RegisterRole(id, name, description string, authorizationID
 	for _, authID := range authorizationIDs {
 		var one int
 		err := tx.QueryRow(
-			`SELECT 1 FROM `+tblAuthorizations+` WHERE id = ?`, authID,
+			`SELECT 1 FROM `+tblAuthorizations+` WHERE id = $1`, authID,
 		).Scan(&one)
 		if err == sql.ErrNoRows {
 			return fmt.Errorf(
@@ -920,7 +914,7 @@ func (sa *SecureAuth) RegisterRole(id, name, description string, authorizationID
 
 	var existingName string
 	errID := tx.QueryRow(
-		`SELECT name FROM `+tblRoles+` WHERE id = ?`, id,
+		`SELECT name FROM `+tblRoles+` WHERE id = $1`, id,
 	).Scan(&existingName)
 	switch {
 	case errID == nil:
@@ -933,7 +927,7 @@ func (sa *SecureAuth) RegisterRole(id, name, description string, authorizationID
 	case errID == sql.ErrNoRows:
 		var existingID string
 		errName := tx.QueryRow(
-			`SELECT id FROM `+tblRoles+` WHERE name = ?`, name,
+			`SELECT id FROM `+tblRoles+` WHERE name = $1`, name,
 		).Scan(&existingID)
 		if errName == nil {
 			return fmt.Errorf(
@@ -945,7 +939,7 @@ func (sa *SecureAuth) RegisterRole(id, name, description string, authorizationID
 			return fmt.Errorf("secureauth: RegisterRole: lookup by name: %w", errName)
 		}
 		if _, err := tx.Exec(
-			`INSERT INTO `+tblRoles+` (id, name, description) VALUES (?, ?, ?)`,
+			`INSERT INTO `+tblRoles+` (id, name, description) VALUES ($1, $2, $3)`,
 			id, name, description,
 		); err != nil {
 			return fmt.Errorf("secureauth: insert role: %w", err)
@@ -956,7 +950,8 @@ func (sa *SecureAuth) RegisterRole(id, name, description string, authorizationID
 
 	for _, authID := range authorizationIDs {
 		if _, err := tx.Exec(
-			`INSERT OR IGNORE INTO `+tblRoleAuth+` (role_id, authorization_id) VALUES (?, ?)`,
+			`INSERT INTO `+tblRoleAuth+` (role_id, authorization_id) VALUES ($1, $2)
+			 ON CONFLICT DO NOTHING`,
 			id, authID,
 		); err != nil {
 			return fmt.Errorf("secureauth: link role %q to authorization %q: %w", id, authID, err)
@@ -978,7 +973,7 @@ func (sa *SecureAuth) RegisterRoleByName(name, description string, authorization
 	for _, n := range authorizationNames {
 		var authID string
 		err := sa.db.QueryRow(
-			`SELECT id FROM `+tblAuthorizations+` WHERE name = ?`, n,
+			`SELECT id FROM `+tblAuthorizations+` WHERE name = $1`, n,
 		).Scan(&authID)
 		if err == sql.ErrNoRows {
 			return "", fmt.Errorf("secureauth: RegisterRoleByName: authorization %q not registered", n)
@@ -1041,7 +1036,7 @@ func (sa *SecureAuth) addBootstrapMasterkeyTx(tx *sql.Tx, authID string) error {
 		return fmt.Errorf("secureauth: addBootstrapMasterkeyTx: seal masterkeys: %w", err)
 	}
 	if _, err := tx.Exec(
-		`UPDATE `+tblBootstrap+` SET sealed_masterkeys = ? WHERE id = 1`,
+		`UPDATE `+tblBootstrap+` SET sealed_masterkeys = $1 WHERE id = 1`,
 		sealed,
 	); err != nil {
 		return fmt.Errorf("secureauth: addBootstrapMasterkeyTx: persist masterkeys: %w", err)
@@ -1068,7 +1063,7 @@ func (sa *SecureAuth) AuthorizationNameByID(authID string) (string, error) {
 func (sa *SecureAuth) UserExists(username string) (bool, error) {
 	var one int
 	err := sa.db.QueryRow(
-		`SELECT 1 FROM `+tblUsers+` WHERE username = ?`, username,
+		`SELECT 1 FROM `+tblUsers+` WHERE username = $1`, username,
 	).Scan(&one)
 	if err == sql.ErrNoRows {
 		return false, nil
@@ -1080,7 +1075,7 @@ func (sa *SecureAuth) UserExists(username string) (bool, error) {
 }
 
 // ---------------------------------------------------------------------------
-// TOTP (RFC 6238 / RFC 4226) — pure-stdlib implementation
+// TOTP (RFC 6238 / RFC 4226)
 // ---------------------------------------------------------------------------
 
 func (sa *SecureAuth) totpGenerateSecret() (raw []byte, sealed []byte, err error) {
@@ -1105,16 +1100,11 @@ func totpHOTP(secret []byte, counter uint64, digits int) string {
 	return fmt.Sprintf("%0*d", digits, code%d)
 }
 
-// totpVerify checks the provided 6-digit code against the secret, accepting
-// a window of ±1 step (30s) to tolerate clock skew. It returns the matched
-// step counter (Unix/30) so callers can enforce replay protection, and a
-// boolean indicating whether any step matched.
 func totpVerify(secret []byte, code string, t time.Time) (uint64, bool) {
 	if len(code) != 6 {
 		return 0, false
 	}
 	step := uint64(t.Unix() / 30)
-	// Check in order so the highest matched step wins.
 	candidates := []uint64{step + 1, step, step - 1}
 	for _, s := range candidates {
 		if subtle.ConstantTimeCompare([]byte(totpHOTP(secret, s, 6)), []byte(code)) == 1 {
@@ -1124,14 +1114,11 @@ func totpVerify(secret []byte, code string, t time.Time) (uint64, bool) {
 	return 0, false
 }
 
-// recordTOTPStep atomically advances the user's last-consumed TOTP step
-// counter. Returns true if the step was accepted, false if the code has
-// already been used (or a concurrent request consumed it first).
 func (sa *SecureAuth) recordTOTPStep(username string, step uint64) bool {
 	res, err := sa.db.Exec(
-		`UPDATE `+tblUsers+` SET totp_last_step = ?
-		 WHERE username = ? AND totp_last_step < ?`,
-		step, username, step,
+		`UPDATE `+tblUsers+` SET totp_last_step = $1
+		 WHERE username = $2 AND totp_last_step < $1`,
+		step, username,
 	)
 	if err != nil {
 		return false
@@ -1171,7 +1158,7 @@ func totpProvisioningURI(secret []byte, username, issuer string) string {
 func (sa *SecureAuth) sessionIsTOTPPending(sessionID string) bool {
 	var pending int
 	_ = sa.db.QueryRow(
-		`SELECT totp_pending FROM `+tblSessions+` WHERE session_id = ?`, sessionID,
+		`SELECT totp_pending FROM `+tblSessions+` WHERE session_id = $1`, sessionID,
 	).Scan(&pending)
 	return pending == 1
 }
@@ -1179,7 +1166,7 @@ func (sa *SecureAuth) sessionIsTOTPPending(sessionID string) bool {
 func (sa *SecureAuth) userHasTOTP(username string) (bool, error) {
 	var enabled int
 	err := sa.db.QueryRow(
-		`SELECT totp_enabled FROM `+tblUsers+` WHERE username = ?`, username,
+		`SELECT totp_enabled FROM `+tblUsers+` WHERE username = $1`, username,
 	).Scan(&enabled)
 	if err == sql.ErrNoRows {
 		return false, nil
@@ -1188,19 +1175,16 @@ func (sa *SecureAuth) userHasTOTP(username string) (bool, error) {
 }
 
 // ---------------------------------------------------------------------------
-// Re-authentication tokens (used to gate credential-changing operations)
+// Re-authentication tokens
 // ---------------------------------------------------------------------------
 
-// issueReauthToken mints a single-use, 5-minute re-authentication token for
-// the given user. It is returned to the client, which then presents it in
-// the X-Reauth-Token header when performing a credential-changing operation.
 func (sa *SecureAuth) issueReauthToken(userID string) (string, error) {
 	token := hex.EncodeToString(randomBytes(32))
 	now := time.Now().UTC()
 	_, err := sa.db.Exec(
 		`INSERT INTO `+tblReauthTokens+`
 		 (token, user_id, created_at, expires_at, used)
-		 VALUES (?, ?, ?, ?, 0)`,
+		 VALUES ($1, $2, $3, $4, 0)`,
 		token, userID, now, now.Add(5*time.Minute),
 	)
 	if err != nil {
@@ -1209,8 +1193,6 @@ func (sa *SecureAuth) issueReauthToken(userID string) (string, error) {
 	return token, nil
 }
 
-// checkReauthToken reports whether the token is a valid, unused, unexpired
-// reauth token bound to userID.
 func (sa *SecureAuth) checkReauthToken(userID, token string) bool {
 	if token == "" || userID == "" {
 		return false
@@ -1218,24 +1200,22 @@ func (sa *SecureAuth) checkReauthToken(userID, token string) bool {
 	var one int
 	err := sa.db.QueryRow(
 		`SELECT 1 FROM `+tblReauthTokens+`
-		 WHERE token = ? AND user_id = ? AND used = 0 AND expires_at > ?`,
+		 WHERE token = $1 AND user_id = $2 AND used = 0 AND expires_at > $3`,
 		token, userID, time.Now().UTC(),
 	).Scan(&one)
 	return err == nil
 }
 
-// consumeReauthToken marks the token used. Safe to call after a successful
-// check; the WHERE clause guarantees a token can only be consumed once.
 func (sa *SecureAuth) consumeReauthToken(userID, token string) {
 	_, _ = sa.db.Exec(
 		`UPDATE `+tblReauthTokens+` SET used = 1
-		 WHERE token = ? AND user_id = ? AND used = 0`,
+		 WHERE token = $1 AND user_id = $2 AND used = 0`,
 		token, userID,
 	)
 }
 
 // ---------------------------------------------------------------------------
-// 2FA HTTP handlers  (served under /api/2fa/*)
+// 2FA HTTP handlers
 // ---------------------------------------------------------------------------
 
 func (sa *SecureAuth) handleTOTPStatus(w http.ResponseWriter, r *http.Request) {
@@ -1260,15 +1240,6 @@ func (sa *SecureAuth) handleTOTPStatus(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleTOTPSetupBegin — POST /api/2fa/setup/begin
-//
-// Generates a fresh TOTP secret, seals it in a temporary challenge row, and
-// returns the provisioning URI + base32 secret for QR display.
-//
-// Blocked when the session is TOTP-pending AND the user already has 2FA
-// configured: in that case the caller must verify, not re-enroll. Without
-// this gate, an attacker with a stolen totp_pending session could silently
-// overwrite the victim's authenticator registration.
 func (sa *SecureAuth) handleTOTPSetupBegin(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -1285,8 +1256,6 @@ func (sa *SecureAuth) handleTOTPSetupBegin(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	// If the user already has TOTP enabled, setup can only proceed from a
-	// fully-verified session — a totp_pending session must verify instead.
 	if sess.TOTPPending {
 		alreadyEnabled, _ := sa.userHasTOTP(sess.UserID)
 		if alreadyEnabled {
@@ -1299,9 +1268,8 @@ func (sa *SecureAuth) handleTOTPSetupBegin(w http.ResponseWriter, r *http.Reques
 		}
 	}
 
-	// If there is an existing pending TOTP challenge, delete it first.
 	_, _ = sa.db.Exec(
-		`DELETE FROM `+tblTOTPChallenges+` WHERE session_id = ?`, sess.SessionID,
+		`DELETE FROM `+tblTOTPChallenges+` WHERE session_id = $1`, sess.SessionID,
 	)
 
 	raw, sealed, err := sa.totpGenerateSecret()
@@ -1314,7 +1282,7 @@ func (sa *SecureAuth) handleTOTPSetupBegin(w http.ResponseWriter, r *http.Reques
 	_, err = sa.db.Exec(
 		`INSERT INTO `+tblTOTPChallenges+`
 		 (id, session_id, created_at, expires_at)
-		 VALUES (?, ?, ?, ?)`,
+		 VALUES ($1, $2, $3, $4)`,
 		challengeID, sess.SessionID,
 		time.Now().UTC(), time.Now().Add(10*time.Minute).UTC(),
 	)
@@ -1344,10 +1312,6 @@ func (sa *SecureAuth) handleTOTPSetupBegin(w http.ResponseWriter, r *http.Reques
 	})
 }
 
-// handleTOTPSetupFinish — POST /api/2fa/setup/finish
-//
-// Verifies the user's first TOTP code, then persists the sealed secret and
-// marks totp_enabled = 1.
 func (sa *SecureAuth) handleTOTPSetupFinish(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -1364,8 +1328,6 @@ func (sa *SecureAuth) handleTOTPSetupFinish(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	// Same gate as handleTOTPSetupBegin: a pending session for a user who
-	// already has 2FA enabled must verify, not re-enroll.
 	if sess.TOTPPending {
 		alreadyEnabled, _ := sa.userHasTOTP(sess.UserID)
 		if alreadyEnabled {
@@ -1391,14 +1353,14 @@ func (sa *SecureAuth) handleTOTPSetupFinish(w http.ResponseWriter, r *http.Reque
 	var storedSessionID string
 	var expires time.Time
 	err = sa.db.QueryRow(
-		`SELECT session_id, expires_at FROM `+tblTOTPChallenges+` WHERE id = ?`,
+		`SELECT session_id, expires_at FROM `+tblTOTPChallenges+` WHERE id = $1`,
 		req.ChallengeID,
 	).Scan(&storedSessionID, &expires)
 	if err != nil || storedSessionID != sess.SessionID || time.Now().After(expires) {
 		http.Error(w, "invalid or expired challenge", http.StatusBadRequest)
 		return
 	}
-	_, _ = sa.db.Exec(`DELETE FROM `+tblTOTPChallenges+` WHERE id = ?`, req.ChallengeID)
+	_, _ = sa.db.Exec(`DELETE FROM `+tblTOTPChallenges+` WHERE id = $1`, req.ChallengeID)
 
 	sealedForChallenge, err := base64.StdEncoding.DecodeString(req.SealedSecret)
 	if err != nil {
@@ -1428,12 +1390,10 @@ func (sa *SecureAuth) handleTOTPSetupFinish(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	// New secret is being installed: overwrite totp_last_step with the
-	// matched step unconditionally.
 	_, err = sa.db.Exec(
 		`UPDATE `+tblUsers+`
-		 SET totp_secret = ?, totp_enabled = 1, totp_last_step = ?
-		 WHERE username = ?`,
+		 SET totp_secret = $1, totp_enabled = 1, totp_last_step = $2
+		 WHERE username = $3`,
 		innerSealed, matchedStep, sess.UserID,
 	)
 	if err != nil {
@@ -1441,14 +1401,13 @@ func (sa *SecureAuth) handleTOTPSetupFinish(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	_, _ = sa.db.Exec(
-		`UPDATE `+tblSessions+` SET totp_pending = 0 WHERE session_id = ?`, sess.SessionID,
+		`UPDATE `+tblSessions+` SET totp_pending = 0 WHERE session_id = $1`, sess.SessionID,
 	)
 
 	sa.appendAudit(sess.UserID, "2fa.setup", "", "allow", ip, "")
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
-// handleTOTPVerify — POST /api/2fa/verify
 func (sa *SecureAuth) handleTOTPVerify(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -1476,7 +1435,7 @@ func (sa *SecureAuth) handleTOTPVerify(w http.ResponseWriter, r *http.Request) {
 
 	var sealedSecret []byte
 	err = sa.db.QueryRow(
-		`SELECT totp_secret FROM `+tblUsers+` WHERE username = ? AND totp_enabled = 1`,
+		`SELECT totp_secret FROM `+tblUsers+` WHERE username = $1 AND totp_enabled = 1`,
 		sess.UserID,
 	).Scan(&sealedSecret)
 	if err != nil {
@@ -1498,7 +1457,7 @@ func (sa *SecureAuth) handleTOTPVerify(w http.ResponseWriter, r *http.Request) {
 	matchedStep, ok := totpVerify(raw, req.Code, time.Now())
 	if !ok {
 		if !sa.rl.allow("2fa-fail:"+sess.UserID, 5, 1.0/120.0) {
-			_, _ = sa.db.Exec(`DELETE FROM `+tblSessions+` WHERE session_id = ?`, sess.SessionID)
+			_, _ = sa.db.Exec(`DELETE FROM `+tblSessions+` WHERE session_id = $1`, sess.SessionID)
 			http.SetCookie(w, &http.Cookie{
 				Name: "secureauth_session", Value: "", Path: "/", MaxAge: -1,
 				Secure: true, HttpOnly: true, SameSite: http.SameSiteLaxMode,
@@ -1513,8 +1472,6 @@ func (sa *SecureAuth) handleTOTPVerify(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Replay protection: reject codes whose step counter has already been
-	// consumed for this user.
 	if !sa.recordTOTPStep(sess.UserID, matchedStep) {
 		sa.appendAudit(sess.UserID, "2fa.verify", "", "deny", ip, "replayed code")
 		http.Error(w, "TOTP code already used", http.StatusUnauthorized)
@@ -1522,13 +1479,12 @@ func (sa *SecureAuth) handleTOTPVerify(w http.ResponseWriter, r *http.Request) {
 	}
 
 	_, _ = sa.db.Exec(
-		`UPDATE `+tblSessions+` SET totp_pending = 0 WHERE session_id = ?`, sess.SessionID,
+		`UPDATE `+tblSessions+` SET totp_pending = 0 WHERE session_id = $1`, sess.SessionID,
 	)
 	sa.appendAudit(sess.UserID, "2fa.verify", "", "allow", ip, "")
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
-// handleTOTPDisable — POST /api/2fa/disable
 func (sa *SecureAuth) handleTOTPDisable(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -1560,7 +1516,7 @@ func (sa *SecureAuth) handleTOTPDisable(w http.ResponseWriter, r *http.Request) 
 
 	var sealedSecret []byte
 	err = sa.db.QueryRow(
-		`SELECT totp_secret FROM `+tblUsers+` WHERE username = ? AND totp_enabled = 1`,
+		`SELECT totp_secret FROM `+tblUsers+` WHERE username = $1 AND totp_enabled = 1`,
 		sess.UserID,
 	).Scan(&sealedSecret)
 	if err != nil {
@@ -1581,7 +1537,7 @@ func (sa *SecureAuth) handleTOTPDisable(w http.ResponseWriter, r *http.Request) 
 	matchedStep, ok := totpVerify(raw, req.Code, time.Now())
 	if !ok {
 		if !sa.rl.allow("2fa-disable-fail:"+sess.UserID, 3, 1.0/120.0) {
-			_, _ = sa.db.Exec(`DELETE FROM `+tblSessions+` WHERE session_id = ?`, sess.SessionID)
+			_, _ = sa.db.Exec(`DELETE FROM `+tblSessions+` WHERE session_id = $1`, sess.SessionID)
 			http.SetCookie(w, &http.Cookie{
 				Name: "secureauth_session", Value: "", Path: "/", MaxAge: -1,
 				Secure: true, HttpOnly: true, SameSite: http.SameSiteLaxMode,
@@ -1603,7 +1559,7 @@ func (sa *SecureAuth) handleTOTPDisable(w http.ResponseWriter, r *http.Request) 
 	}
 
 	_, err = sa.db.Exec(
-		`UPDATE `+tblUsers+` SET totp_secret = NULL, totp_enabled = 0, totp_last_step = 0 WHERE username = ?`,
+		`UPDATE `+tblUsers+` SET totp_secret = NULL, totp_enabled = 0, totp_last_step = 0 WHERE username = $1`,
 		sess.UserID,
 	)
 	if err != nil {
@@ -1626,13 +1582,9 @@ func SecureAuthAndCommHandler(sa *SecureAuth, mux *http.ServeMux) http.Handler {
 	mux.HandleFunc("/api/login/init", sa.wrap(sa.handleLoginInit, false))
 	mux.HandleFunc("/api/login2", sa.wrap(sa.handleLogin2, false))
 
-	// Re-auth flow: requires an authenticated session, issues a short-lived
-	// single-use token that gates credential-changing operations.
 	mux.HandleFunc("/api/reauth/init", sa.wrap(sa.handleReauthInit, true))
 	mux.HandleFunc("/api/reauth/finish", sa.wrap(sa.handleReauthFinish, true))
 
-	// /logout must be CSRF-exempt: a stale session cookie can otherwise
-	// block the browser from ever clearing it.
 	mux.HandleFunc("/logout", sa.wrap(sa.handleLogout, false))
 
 	mux.HandleFunc("/api/privatekey", sa.wrap(sa.loadSession(sa.handleGetPrivateKey), true))
@@ -1792,8 +1744,6 @@ func (rl *rateLimiter) allow(key string, burst float64, refillPerSec float64) bo
 	return true
 }
 
-// setTokens forcefully sets the token count for a key. Used at startup to
-// restore brute-force budgets from the persisted audit log.
 func (rl *rateLimiter) setTokens(key string, tokens float64) {
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
@@ -1827,14 +1777,15 @@ func (sa *SecureAuth) appendAudit(userID, action, resource, result, ip, details 
 	)
 	_ = row.Scan(&prevHash)
 
-	ts := time.Now().UTC().Format(time.RFC3339Nano)
-	entryHash := sa.auditHash(prevHash, ts, userID, action, resource, result, ip, details)
+	ts := time.Now().UTC()
+	tsStr := ts.Format(time.RFC3339Nano)
+	entryHash := sa.auditHash(prevHash, tsStr, userID, action, resource, result, ip, details)
 
 	_, _ = sa.db.Exec(
 		`INSERT INTO `+tblAudit+`
 		 (timestamp, user_id, action, resource, result, ip_address, details,
 		  prev_hash, entry_hash)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
 		ts, userID, action, resource, result, ip, details, prevHash, entryHash,
 	)
 }
@@ -1853,8 +1804,9 @@ func (sa *SecureAuth) VerifyAuditChain() error {
 	var prev []byte
 	for rows.Next() {
 		var (
-			prevHash, entryHash                               []byte
-			ts, userID, action, resource, result, ip, details string
+			prevHash, entryHash                           []byte
+			ts                                            time.Time
+			userID, action, resource, result, ip, details sql.NullString
 		)
 		if err := rows.Scan(&prevHash, &entryHash, &ts, &userID, &action,
 			&resource, &result, &ip, &details); err != nil {
@@ -1863,7 +1815,9 @@ func (sa *SecureAuth) VerifyAuditChain() error {
 		if !hmac.Equal(prevHash, prev) {
 			return errors.New("secureauth: audit chain broken (prev_hash mismatch)")
 		}
-		expected := sa.auditHash(prevHash, ts, userID, action, resource, result, ip, details)
+		tsStr := ts.Format(time.RFC3339Nano)
+		expected := sa.auditHash(prevHash, tsStr, userID.String, action.String,
+			resource.String, result.String, ip.String, details.String)
 		if !hmac.Equal(expected, entryHash) {
 			return errors.New("secureauth: audit chain broken (entry_hash mismatch)")
 		}
@@ -1893,7 +1847,7 @@ func (sa *SecureAuth) verifyCSRF(r *http.Request) error {
 	}
 	var stored string
 	err := sa.db.QueryRow(
-		`SELECT csrf_token FROM `+tblSessions+` WHERE session_id = ?`, sessionID,
+		`SELECT csrf_token FROM `+tblSessions+` WHERE session_id = $1`, sessionID,
 	).Scan(&stored)
 	if err != nil {
 		return errors.New("no session row")
@@ -1938,13 +1892,13 @@ func (sa *SecureAuth) loadSessionInfo(r *http.Request) (*sessionInfo, error) {
 	)
 	err := sa.db.QueryRow(
 		`SELECT user_id, session_key_ciphertext, csrf_token, expires_at, totp_pending
-		 FROM `+tblSessions+` WHERE session_id = ?`, sid,
+		 FROM `+tblSessions+` WHERE session_id = $1`, sid,
 	).Scan(&userID, &keyCipher, &csrf, &expires, &totpPending)
 	if err != nil {
 		return nil, err
 	}
 	if time.Now().After(expires) {
-		_, _ = sa.db.Exec(`DELETE FROM `+tblSessions+` WHERE session_id = ?`, sid)
+		_, _ = sa.db.Exec(`DELETE FROM `+tblSessions+` WHERE session_id = $1`, sid)
 		return nil, errors.New("session expired")
 	}
 	key, err := sa.open(keyCipher, aadSessionKey)
@@ -2080,7 +2034,7 @@ func (sa *SecureAuth) UserHasAuthorization(r *http.Request, authorizationName st
 	}
 	var authID string
 	err = sa.db.QueryRow(
-		`SELECT id FROM `+tblAuthorizations+` WHERE name = ?`,
+		`SELECT id FROM `+tblAuthorizations+` WHERE name = $1`,
 		authorizationName,
 	).Scan(&authID)
 	if err == sql.ErrNoRows {
@@ -2097,7 +2051,7 @@ func (sa *SecureAuth) userHasPermission(userID, permission string) (bool, error)
 		`SELECT a.name FROM `+tblAuthorizations+` a
 		 JOIN `+tblRoleAuth+` ra ON ra.authorization_id = a.id
 		 JOIN `+tblUserRoles+` ur ON ur.role_id = ra.role_id
-		 WHERE ur.user_id = ?`, userID,
+		 WHERE ur.user_id = $1`, userID,
 	)
 	if err != nil {
 		return false, err
@@ -2115,12 +2069,11 @@ func (sa *SecureAuth) userHasPermission(userID, permission string) (bool, error)
 	return false, nil
 }
 
-// rolesOfUser returns the names of every role currently assigned to userID.
 func (sa *SecureAuth) rolesOfUser(userID string) ([]string, error) {
 	rows, err := sa.db.Query(
 		`SELECT r.name FROM `+tblRoles+` r
 		 JOIN `+tblUserRoles+` ur ON ur.role_id = r.id
-		 WHERE ur.user_id = ?`, userID,
+		 WHERE ur.user_id = $1`, userID,
 	)
 	if err != nil {
 		return nil, err
@@ -2142,7 +2095,7 @@ func (sa *SecureAuth) userHasRole(userID, role string) (bool, error) {
 	err := sa.db.QueryRow(
 		`SELECT r.id FROM `+tblRoles+` r
 		 JOIN `+tblUserRoles+` ur ON ur.role_id = r.id
-		 WHERE ur.user_id = ? AND r.name = ?`, userID, role,
+		 WHERE ur.user_id = $1 AND r.name = $2`, userID, role,
 	).Scan(&id)
 	if err == sql.ErrNoRows {
 		return false, nil
@@ -2251,7 +2204,7 @@ func (sa *SecureAuth) handleRegisterInit(w http.ResponseWriter, r *http.Request)
 
 	var credID []byte
 	err = sa.db.QueryRow(
-		`SELECT opaque_credential_id FROM `+tblUsers+` WHERE username = ?`,
+		`SELECT opaque_credential_id FROM `+tblUsers+` WHERE username = $1`,
 		req.Username,
 	).Scan(&credID)
 	if err == sql.ErrNoRows {
@@ -2272,7 +2225,7 @@ func (sa *SecureAuth) handleRegisterInit(w http.ResponseWriter, r *http.Request)
 	_, err = sa.db.Exec(
 		`INSERT INTO `+tblPendingRegs+`
 		 (id, username, credential_id, created_at, expires_at)
-		 VALUES (?, ?, ?, ?, ?)`,
+		 VALUES ($1, $2, $3, $4, $5)`,
 		pendingID, req.Username, credID,
 		time.Now().UTC(), time.Now().Add(10*time.Minute),
 	)
@@ -2287,9 +2240,6 @@ func (sa *SecureAuth) handleRegisterInit(w http.ResponseWriter, r *http.Request)
 	})
 }
 
-// startLoginInit implements the OPAQUE KE1 -> KE2 leg for both login and
-// reauth flows. `purpose` is stored on the login-attempt row and validated
-// by the corresponding finish handler.
 func (sa *SecureAuth) startLoginInit(w http.ResponseWriter, r *http.Request, username, purpose string) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -2337,12 +2287,9 @@ func (sa *SecureAuth) startLoginInit(w http.ResponseWriter, r *http.Request, use
 		return
 	}
 
-	// Per-user KSF salt. For a non-existent user, return a deterministic
-	// fake salt derived from the master key so that repeated probes cannot
-	// distinguish real users (stable salt) from unknown users (also stable).
 	var ksfSalt []byte
 	err = sa.db.QueryRow(
-		`SELECT ksf_salt FROM `+tblUsers+` WHERE username = ?`, username,
+		`SELECT ksf_salt FROM `+tblUsers+` WHERE username = $1`, username,
 	).Scan(&ksfSalt)
 	if err == sql.ErrNoRows {
 		ksfSalt = sa.fakeKSFSalt(username)
@@ -2351,7 +2298,6 @@ func (sa *SecureAuth) startLoginInit(w http.ResponseWriter, r *http.Request, use
 		return
 	}
 	if len(ksfSalt) == 0 {
-		// Legacy rows with NULL ksf_salt fall back to a fixed zero-salt.
 		ksfSalt = make([]byte, 32)
 	}
 
@@ -2368,7 +2314,7 @@ func (sa *SecureAuth) startLoginInit(w http.ResponseWriter, r *http.Request, use
 		`INSERT INTO `+tblLoginAttempts+`
 		 (id, username, credential_id, client_mac, session_secret,
 		  transcript_hash, created_at, expires_at, purpose)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
 		attemptID, username, credID,
 		output.ClientMAC, output.SessionSecret,
 		transcriptHash[:], time.Now().UTC(), expires, purpose,
@@ -2386,8 +2332,6 @@ func (sa *SecureAuth) startLoginInit(w http.ResponseWriter, r *http.Request, use
 }
 
 func (sa *SecureAuth) handleLoginInit(w http.ResponseWriter, r *http.Request) {
-	// We decode the body ourselves because startLoginInit expects the
-	// username to be pulled out separately.
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -2405,15 +2349,10 @@ func (sa *SecureAuth) handleLoginInit(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
-	// Rebuild the body for startLoginInit so it can re-parse the KE1.
 	r.Body = io.NopCloser(strings.NewReader(`{"ke1":"` + envelope.KE1 + `"}`))
 	sa.startLoginInit(w, r, envelope.Username, "login")
 }
 
-// handleReauthInit — POST /api/reauth/init
-//
-// Re-runs the OPAQUE KE1->KE2 leg against the current session's user. No
-// username comes from the body: re-auth is only ever for the caller.
 func (sa *SecureAuth) handleReauthInit(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -2424,7 +2363,6 @@ func (sa *SecureAuth) handleReauthInit(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
-	// Reject if the current session is not fully authenticated.
 	if sess.TOTPPending {
 		sa.respondTOTPRequired(w, sess.UserID)
 		return
@@ -2439,7 +2377,7 @@ func (sa *SecureAuth) loadClientRecord(username string) (*opaque.ClientRecord, [
 	)
 	err := sa.db.QueryRow(
 		`SELECT opaque_registration_record, opaque_credential_id
-         FROM `+tblUsers+` WHERE username = ?`, username,
+         FROM `+tblUsers+` WHERE username = $1`, username,
 	).Scan(&recBytes, &credID)
 
 	if err == sql.ErrNoRows {
@@ -2473,9 +2411,6 @@ func (sa *SecureAuth) fakeCredentialID(username string) []byte {
 	return hmacSHA256(sa.masterKey, []byte("fake-cred-id:"+username))
 }
 
-// finishLogin2 implements the OPAQUE KE3 -> session leg. When purpose ==
-// "reauth" it issues a reauth token bound to the caller's user instead of a
-// new session cookie. In both cases the login-attempt row is consumed.
 func (sa *SecureAuth) finishLogin2(w http.ResponseWriter, r *http.Request, purpose string) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -2510,18 +2445,18 @@ func (sa *SecureAuth) finishLogin2(w http.ResponseWriter, r *http.Request, purpo
 	err := sa.db.QueryRow(
 		`SELECT username, credential_id, client_mac, session_secret,
 		        transcript_hash, expires_at, purpose
-		 FROM `+tblLoginAttempts+` WHERE id = ?`, req.LoginAttemptID,
+		 FROM `+tblLoginAttempts+` WHERE id = $1`, req.LoginAttemptID,
 	).Scan(&username, &credID, &storedMAC, &storedSecret, &transcriptHash, &expires, &storedPurpose)
 	if err != nil || storedPurpose != purpose {
 		sa.genericAuthFailure(w)
 		return
 	}
 	if time.Now().After(expires) {
-		_, _ = sa.db.Exec(`DELETE FROM `+tblLoginAttempts+` WHERE id = ?`, req.LoginAttemptID)
+		_, _ = sa.db.Exec(`DELETE FROM `+tblLoginAttempts+` WHERE id = $1`, req.LoginAttemptID)
 		sa.genericAuthFailure(w)
 		return
 	}
-	_, _ = sa.db.Exec(`DELETE FROM `+tblLoginAttempts+` WHERE id = ?`, req.LoginAttemptID)
+	_, _ = sa.db.Exec(`DELETE FROM `+tblLoginAttempts+` WHERE id = $1`, req.LoginAttemptID)
 
 	if !sa.rl.allow("login2-user:"+username, 5, 1.0/60.0) {
 		http.Error(w, "rate limited", http.StatusTooManyRequests)
@@ -2598,12 +2533,7 @@ func (sa *SecureAuth) finishLogin2(w http.ResponseWriter, r *http.Request, purpo
 		32,
 	)
 
-	// ---------------------------------------------------------------------
-	// Reauth branch: no new session, just a short-lived token.
-	// ---------------------------------------------------------------------
 	if purpose == "reauth" {
-		// Verify that the session that initiated the reauth is the same
-		// user we just authenticated as.
 		callerSess, err := sa.loadSessionInfo(r)
 		if err != nil || callerSess.UserID != username {
 			sa.genericAuthFailure(w)
@@ -2621,9 +2551,6 @@ func (sa *SecureAuth) finishLogin2(w http.ResponseWriter, r *http.Request, purpo
 		return
 	}
 
-	// ---------------------------------------------------------------------
-	// Login branch: create a session.
-	// ---------------------------------------------------------------------
 	sessionKeyEnc, err := sa.seal(sessionKey, aadSessionKey)
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
@@ -2636,18 +2563,6 @@ func (sa *SecureAuth) finishLogin2(w http.ResponseWriter, r *http.Request, purpo
 		return
 	}
 
-	// Bootstrap special case.
-	//
-	// During first-run bootstrap, the auto-created admin's very first
-	// session must not be gated on TOTP: the client has not yet been
-	// shown a provisioning URI, so it cannot complete TOTP setup before
-	// the bootstrap flow needs to commit wrapped masterkeys.
-	//
-	// We only exempt the specific user named in the unconsumed bootstrap
-	// record, and only while the record remains unconsumed. Once
-	// /api/bootstrap/first-user commits (consumed = 1), the flag flips
-	// and every subsequent session — including this admin's next login —
-	// goes through the normal TOTP path.
 	isBootstrapAdmin := false
 	{
 		var consumed int
@@ -2677,7 +2592,7 @@ func (sa *SecureAuth) finishLogin2(w http.ResponseWriter, r *http.Request, purpo
 		  created_at, expires_at, paake_transcript_hash,
 		  client_ephemeral_public_key, server_ephemeral_public_key,
 		  totp_pending)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
 		sessionID, username, sessionKeyEnc, csrfToken,
 		time.Now().UTC(), expiresAt, transcriptHash, clientEph, serverEphPub,
 		totpPendingInt,
@@ -2712,7 +2627,6 @@ func (sa *SecureAuth) handleLogin2(w http.ResponseWriter, r *http.Request) {
 	sa.finishLogin2(w, r, "login")
 }
 
-// handleReauthFinish — POST /api/reauth/finish
 func (sa *SecureAuth) handleReauthFinish(w http.ResponseWriter, r *http.Request) {
 	sa.finishLogin2(w, r, "reauth")
 }
@@ -2741,7 +2655,7 @@ func (sa *SecureAuth) handleGetPrivateKey(w http.ResponseWriter, r *http.Request
 		        private_key_salt, private_key_kdf_info,
 		        encrypted_rsa_signing_private_key, signing_key_nonce,
 		        signing_key_salt, signing_key_kdf_info
-		 FROM `+tblUsers+` WHERE username = ?`, sess.UserID,
+		 FROM `+tblUsers+` WHERE username = $1`, sess.UserID,
 	).Scan(&encKey, &nonce, &salt, &kdfInfo,
 		&encSignKey, &signNonce, &signSalt, &signKDFInfo)
 	if err != nil {
@@ -2771,7 +2685,7 @@ func (sa *SecureAuth) handleLogout(w http.ResponseWriter, r *http.Request) {
 	}
 	sid := sessionIDFromRequest(r)
 	if sid != "" {
-		_, _ = sa.db.Exec(`DELETE FROM `+tblSessions+` WHERE session_id = ?`, sid)
+		_, _ = sa.db.Exec(`DELETE FROM `+tblSessions+` WHERE session_id = $1`, sid)
 	}
 	http.SetCookie(w, &http.Cookie{
 		Name: "secureauth_session", Value: "", Path: "/", MaxAge: -1,
@@ -2842,7 +2756,7 @@ func (sa *SecureAuth) handleCreateUser(w http.ResponseWriter, r *http.Request) {
 		pending string
 	)
 	err = sa.db.QueryRow(
-		`SELECT credential_id, username FROM `+tblPendingRegs+` WHERE id = ?`,
+		`SELECT credential_id, username FROM `+tblPendingRegs+` WHERE id = $1`,
 		req.PendingRegID,
 	).Scan(&credID, &pending)
 	if err != nil || pending != req.Username {
@@ -2885,7 +2799,7 @@ func (sa *SecureAuth) handleCreateUser(w http.ResponseWriter, r *http.Request) {
 	}
 	defer tx.Rollback()
 
-	_, _ = tx.Exec(`DELETE FROM `+tblPendingRegs+` WHERE id = ?`, req.PendingRegID)
+	_, _ = tx.Exec(`DELETE FROM `+tblPendingRegs+` WHERE id = $1`, req.PendingRegID)
 
 	now := time.Now().UTC()
 	_, err = tx.Exec(
@@ -2897,7 +2811,8 @@ func (sa *SecureAuth) handleCreateUser(w http.ResponseWriter, r *http.Request) {
 		  signing_key_nonce, signing_key_salt, signing_key_kdf_info,
 		  ksf_salt,
 		  created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
+		         $14, $15, $16)`,
 		req.Username, recBytes, credID,
 		pub, encPriv, nonce, salt, req.PrivateKeyKDFInfo,
 		signPub, signEncPriv, signNonce, signSalt, req.SigningKeyKDFInfo,
@@ -2912,7 +2827,8 @@ func (sa *SecureAuth) handleCreateUser(w http.ResponseWriter, r *http.Request) {
 	for _, roleName := range roleNames {
 		roleID := "role-" + roleName
 		_, _ = tx.Exec(
-			`INSERT OR IGNORE INTO `+tblUserRoles+` (user_id, role_id) VALUES (?, ?)`,
+			`INSERT INTO `+tblUserRoles+` (user_id, role_id) VALUES ($1, $2)
+			 ON CONFLICT DO NOTHING`,
 			req.Username, roleID,
 		)
 	}
@@ -2956,13 +2872,13 @@ func (sa *SecureAuth) handleDeleteUser(w http.ResponseWriter, r *http.Request) {
 	}
 	defer tx.Rollback()
 
-	_, _ = tx.Exec(`DELETE FROM `+tblUsers+` WHERE username = ?`, req.UserID)
-	_, _ = tx.Exec(`DELETE FROM `+tblSessions+` WHERE user_id = ?`, req.UserID)
+	_, _ = tx.Exec(`DELETE FROM `+tblUsers+` WHERE username = $1`, req.UserID)
+	_, _ = tx.Exec(`DELETE FROM `+tblSessions+` WHERE user_id = $1`, req.UserID)
 	_, _ = tx.Exec(
-		`UPDATE `+tblSharedKeys+` SET revoked_at = ?, revocation_reason = 'user deleted'
-		 WHERE user_id = ? AND revoked_at IS NULL`, now, req.UserID,
+		`UPDATE `+tblSharedKeys+` SET revoked_at = $1, revocation_reason = 'user deleted'
+		 WHERE user_id = $2 AND revoked_at IS NULL`, now, req.UserID,
 	)
-	_, _ = tx.Exec(`DELETE FROM `+tblUserRoles+` WHERE user_id = ?`, req.UserID)
+	_, _ = tx.Exec(`DELETE FROM `+tblUserRoles+` WHERE user_id = $1`, req.UserID)
 
 	if err := revokeStaleSharedKeysTx(tx, now); err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
@@ -3007,7 +2923,7 @@ func (sa *SecureAuth) handleGetUsers(w http.ResponseWriter, r *http.Request) {
 		roleRows, _ := sa.db.Query(
 			`SELECT r.name FROM `+tblRoles+` r
 			 JOIN `+tblUserRoles+` ur ON ur.role_id = r.id
-			 WHERE ur.user_id = ?`, username,
+			 WHERE ur.user_id = $1`, username,
 		)
 		var roles []string
 		if roleRows != nil {
@@ -3029,8 +2945,6 @@ func (sa *SecureAuth) handleGetUsers(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]interface{}{"users": users})
 }
 
-// updateUserRequest accepts either a legacy single `newRole` string or a
-// `newRoles` array. KDF-info fields are preserved across credential resets.
 type updateUserRequest struct {
 	UserID                 string   `json:"userId"`
 	NewRole                string   `json:"newRole,omitempty"`
@@ -3065,21 +2979,17 @@ func (sa *SecureAuth) handleUpdateUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Credential-changing operations.
 	credentialChange := req.PendingRegID != "" ||
 		req.RegistrationRecord != "" ||
 		req.EncryptedRSAPrivateKey != "" ||
 		req.EncryptedRSASigningKey != ""
 
-	// Role-changing operations (either the plural or legacy singular field).
 	requestedRoles := req.NewRoles
 	if len(requestedRoles) == 0 && req.NewRole != "" {
 		requestedRoles = []string{req.NewRole}
 	}
 	roleChange := len(requestedRoles) > 0
 
-	// Both credential changes and role changes are security-sensitive:
-	// require a fresh re-authentication token for either.
 	if credentialChange || roleChange {
 		reauthToken := r.Header.Get("X-Reauth-Token")
 		if !sa.checkReauthToken(sess.UserID, reauthToken) {
@@ -3091,10 +3001,6 @@ func (sa *SecureAuth) handleUpdateUser(w http.ResponseWriter, r *http.Request) {
 		defer sa.consumeReauthToken(sess.UserID, reauthToken)
 	}
 
-	// Role-hierarchy enforcement: a non-SuperAdmin caller may only add or
-	// remove roles it already holds. This prevents an Admin from promoting
-	// itself (or anyone else) to SuperAdmin, and prevents an Admin from
-	// demoting a SuperAdmin.
 	callerIsSuper, err := sa.userHasRole(sess.UserID, "SuperAdmin")
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
@@ -3126,7 +3032,6 @@ func (sa *SecureAuth) handleUpdateUser(w http.ResponseWriter, r *http.Request) {
 			requestedSet[rn] = struct{}{}
 		}
 
-		// Every role the caller is trying to *grant* must already be held.
 		for rn := range requestedSet {
 			if _, ok := callerSet[rn]; !ok {
 				sa.appendAudit(sess.UserID, "user.update", req.UserID, "deny",
@@ -3137,7 +3042,6 @@ func (sa *SecureAuth) handleUpdateUser(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
-		// Every role the caller is trying to *revoke* must also be held.
 		for rn := range targetSet {
 			if _, held := callerSet[rn]; held {
 				continue
@@ -3167,14 +3071,14 @@ func (sa *SecureAuth) handleUpdateUser(w http.ResponseWriter, r *http.Request) {
 		var credID []byte
 		var pendingUser string
 		err := tx.QueryRow(
-			`SELECT credential_id, username FROM `+tblPendingRegs+` WHERE id = ?`,
+			`SELECT credential_id, username FROM `+tblPendingRegs+` WHERE id = $1`,
 			req.PendingRegID,
 		).Scan(&credID, &pendingUser)
 		if err != nil || pendingUser != req.UserID {
 			http.Error(w, "bad request", http.StatusBadRequest)
 			return
 		}
-		_, _ = tx.Exec(`DELETE FROM `+tblPendingRegs+` WHERE id = ?`, req.PendingRegID)
+		_, _ = tx.Exec(`DELETE FROM `+tblPendingRegs+` WHERE id = $1`, req.PendingRegID)
 
 		if req.RegistrationRecord == "" {
 			http.Error(w, "bad request: registration_record required", http.StatusBadRequest)
@@ -3210,14 +3114,14 @@ func (sa *SecureAuth) handleUpdateUser(w http.ResponseWriter, r *http.Request) {
 
 		_, err = tx.Exec(
 			`UPDATE `+tblUsers+` SET
-			 opaque_registration_record = ?,
-			 encrypted_rsa_private_key = ?, private_key_nonce = ?,
-			 private_key_salt = ?, private_key_kdf_info = ?,
-			 encrypted_rsa_signing_private_key = ?, signing_key_nonce = ?,
-			 signing_key_salt = ?, signing_key_kdf_info = ?,
-			 ksf_salt = ?,
-			 updated_at = ?
-			 WHERE username = ?`,
+			 opaque_registration_record = $1,
+			 encrypted_rsa_private_key = $2, private_key_nonce = $3,
+			 private_key_salt = $4, private_key_kdf_info = $5,
+			 encrypted_rsa_signing_private_key = $6, signing_key_nonce = $7,
+			 signing_key_salt = $8, signing_key_kdf_info = $9,
+			 ksf_salt = $10,
+			 updated_at = $11
+			 WHERE username = $12`,
 			recBytes,
 			encPriv, nonce, salt, req.PrivateKeyKDFInfo,
 			signEncPriv, signNonce, signSalt, req.SigningKeyKDFInfo,
@@ -3232,11 +3136,12 @@ func (sa *SecureAuth) handleUpdateUser(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if len(requestedRoles) > 0 {
-		_, _ = tx.Exec(`DELETE FROM `+tblUserRoles+` WHERE user_id = ?`, req.UserID)
+		_, _ = tx.Exec(`DELETE FROM `+tblUserRoles+` WHERE user_id = $1`, req.UserID)
 		for _, roleName := range requestedRoles {
 			roleID := "role-" + roleName
 			_, _ = tx.Exec(
-				`INSERT OR IGNORE INTO `+tblUserRoles+` (user_id, role_id) VALUES (?, ?)`,
+				`INSERT INTO `+tblUserRoles+` (user_id, role_id) VALUES ($1, $2)
+				 ON CONFLICT DO NOTHING`,
 				req.UserID, roleID,
 			)
 		}
@@ -3290,7 +3195,7 @@ func (sa *SecureAuth) handleShareKeys(w http.ResponseWriter, r *http.Request) {
 
 	var signPubBytes []byte
 	err := sa.db.QueryRow(
-		`SELECT rsa_signing_public_key FROM `+tblUsers+` WHERE username = ?`,
+		`SELECT rsa_signing_public_key FROM `+tblUsers+` WHERE username = $1`,
 		sess.UserID,
 	).Scan(&signPubBytes)
 	if err != nil || len(signPubBytes) == 0 {
@@ -3320,17 +3225,13 @@ func (sa *SecureAuth) handleShareKeys(w http.ResponseWriter, r *http.Request) {
 
 	var targetPub []byte
 	err = sa.db.QueryRow(
-		`SELECT rsa_public_key FROM `+tblUsers+` WHERE username = ?`, userID,
+		`SELECT rsa_public_key FROM `+tblUsers+` WHERE username = $1`, userID,
 	).Scan(&targetPub)
 	if err != nil {
 		http.Error(w, "target user not found", http.StatusNotFound)
 		return
 	}
 
-	// Structural sanity check: the wrapped blob must be exactly one
-	// RSA-OAEP ciphertext under the target user's modulus. Without this, a
-	// malicious admin can sign an arbitrary blob and permanently lock the
-	// target user out of the authorization.
 	targetPubAny, err := x509.ParsePKIXPublicKey(targetPub)
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
@@ -3375,14 +3276,14 @@ func (sa *SecureAuth) handleShareKeys(w http.ResponseWriter, r *http.Request) {
 
 	_, _ = tx.Exec(
 		`DELETE FROM `+tblSharedKeys+`
-		 WHERE user_id = ? AND authorization_id = ? AND key_version = ?`,
+		 WHERE user_id = $1 AND authorization_id = $2 AND key_version = $3`,
 		userID, req.AuthorizationID, req.KeyVersion,
 	)
 	_, err = tx.Exec(
 		`INSERT INTO `+tblSharedKeys+`
 		 (user_id, authorization_id, wrapped_key, admin_signature,
 		  key_version, created_at)
-		 VALUES (?, ?, ?, ?, ?, ?)`,
+		 VALUES ($1, $2, $3, $4, $5, $6)`,
 		userID, req.AuthorizationID, wrapped, sig, req.KeyVersion, now,
 	)
 	if err != nil {
@@ -3403,7 +3304,7 @@ func (sa *SecureAuth) handleShareKeys(w http.ResponseWriter, r *http.Request) {
 func (sa *SecureAuth) handleSharedKeysCheck(w http.ResponseWriter, r *http.Request, sess *sessionInfo) {
 	rows, err := sa.db.Query(
 		`SELECT DISTINCT authorization_id FROM `+tblSharedKeys+`
-		 WHERE user_id = ? AND revoked_at IS NULL`, sess.UserID,
+		 WHERE user_id = $1 AND revoked_at IS NULL`, sess.UserID,
 	)
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
@@ -3455,7 +3356,7 @@ func (sa *SecureAuth) handleGetWrappedMasterkey(w http.ResponseWriter, r *http.R
 	var keyVersion int
 	err = sa.db.QueryRow(
 		`SELECT wrapped_key, key_version FROM `+tblSharedKeys+`
-		 WHERE user_id = ? AND authorization_id = ? AND revoked_at IS NULL
+		 WHERE user_id = $1 AND authorization_id = $2 AND revoked_at IS NULL
 		 ORDER BY key_version DESC LIMIT 1`,
 		sess.UserID, req.AuthorizationID,
 	).Scan(&wrapped, &keyVersion)
@@ -3484,11 +3385,14 @@ func (sa *SecureAuth) handleGetRoles(w http.ResponseWriter, r *http.Request) {
 	defer rows.Close()
 	var roles []map[string]string
 	for rows.Next() {
-		var id, name, desc string
+		var id, name string
+		var desc sql.NullString
 		if err := rows.Scan(&id, &name, &desc); err != nil {
 			continue
 		}
-		roles = append(roles, map[string]string{"id": id, "name": name, "description": desc})
+		roles = append(roles, map[string]string{
+			"id": id, "name": name, "description": desc.String,
+		})
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{"roles": roles})
 }
@@ -3513,7 +3417,7 @@ func (sa *SecureAuth) handleAddRole(w http.ResponseWriter, r *http.Request) {
 	defer tx.Rollback()
 
 	_, err = tx.Exec(
-		`INSERT INTO `+tblRoles+` (id, name, description) VALUES (?, ?, ?)`,
+		`INSERT INTO `+tblRoles+` (id, name, description) VALUES ($1, $2, $3)`,
 		id, req.Name, req.Description,
 	)
 	if err != nil {
@@ -3522,7 +3426,8 @@ func (sa *SecureAuth) handleAddRole(w http.ResponseWriter, r *http.Request) {
 	}
 	for _, a := range req.Authorizations {
 		_, _ = tx.Exec(
-			`INSERT OR IGNORE INTO `+tblRoleAuth+` (role_id, authorization_id) VALUES (?, ?)`,
+			`INSERT INTO `+tblRoleAuth+` (role_id, authorization_id) VALUES ($1, $2)
+			 ON CONFLICT DO NOTHING`,
 			id, a,
 		)
 	}
@@ -3554,16 +3459,17 @@ func (sa *SecureAuth) handleUpdateRole(w http.ResponseWriter, r *http.Request) {
 	defer tx.Rollback()
 
 	if req.Name != "" {
-		_, _ = tx.Exec(`UPDATE `+tblRoles+` SET name = ? WHERE id = ?`, req.Name, req.RoleID)
+		_, _ = tx.Exec(`UPDATE `+tblRoles+` SET name = $1 WHERE id = $2`, req.Name, req.RoleID)
 	}
 	if req.Description != "" {
-		_, _ = tx.Exec(`UPDATE `+tblRoles+` SET description = ? WHERE id = ?`, req.Description, req.RoleID)
+		_, _ = tx.Exec(`UPDATE `+tblRoles+` SET description = $1 WHERE id = $2`, req.Description, req.RoleID)
 	}
 	if req.Authorizations != nil {
-		_, _ = tx.Exec(`DELETE FROM `+tblRoleAuth+` WHERE role_id = ?`, req.RoleID)
+		_, _ = tx.Exec(`DELETE FROM `+tblRoleAuth+` WHERE role_id = $1`, req.RoleID)
 		for _, a := range req.Authorizations {
 			_, _ = tx.Exec(
-				`INSERT OR IGNORE INTO `+tblRoleAuth+` (role_id, authorization_id) VALUES (?, ?)`,
+				`INSERT INTO `+tblRoleAuth+` (role_id, authorization_id) VALUES ($1, $2)
+				 ON CONFLICT DO NOTHING`,
 				req.RoleID, a,
 			)
 		}
@@ -3598,9 +3504,9 @@ func (sa *SecureAuth) handleDeleteRole(w http.ResponseWriter, r *http.Request) {
 	}
 	defer tx.Rollback()
 
-	_, _ = tx.Exec(`DELETE FROM `+tblRoles+` WHERE id = ?`, req.RoleID)
-	_, _ = tx.Exec(`DELETE FROM `+tblRoleAuth+` WHERE role_id = ?`, req.RoleID)
-	_, _ = tx.Exec(`DELETE FROM `+tblUserRoles+` WHERE role_id = ?`, req.RoleID)
+	_, _ = tx.Exec(`DELETE FROM `+tblRoles+` WHERE id = $1`, req.RoleID)
+	_, _ = tx.Exec(`DELETE FROM `+tblRoleAuth+` WHERE role_id = $1`, req.RoleID)
+	_, _ = tx.Exec(`DELETE FROM `+tblUserRoles+` WHERE role_id = $1`, req.RoleID)
 
 	if err := revokeStaleSharedKeysTx(tx, now); err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
@@ -3629,12 +3535,13 @@ func (sa *SecureAuth) handleGetAuthorizations(w http.ResponseWriter, r *http.Req
 	defer rows.Close()
 	var auths []map[string]interface{}
 	for rows.Next() {
-		var id, name, desc string
+		var id, name string
+		var desc sql.NullString
 		if err := rows.Scan(&id, &name, &desc); err != nil {
 			continue
 		}
 		auths = append(auths, map[string]interface{}{
-			"id": id, "name": name, "description": desc,
+			"id": id, "name": name, "description": desc.String,
 		})
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{"authorizations": auths})
@@ -3652,7 +3559,7 @@ func (sa *SecureAuth) handleAddAuthorization(w http.ResponseWriter, r *http.Requ
 	id := "auth-" + hex.EncodeToString(randomBytes(8))
 	_, err := sa.db.Exec(
 		`INSERT INTO `+tblAuthorizations+` (id, name, description)
-		 VALUES (?, ?, ?)`,
+		 VALUES ($1, $2, $3)`,
 		id, req.Name, req.Description,
 	)
 	if err != nil {
@@ -3673,10 +3580,10 @@ func (sa *SecureAuth) handleUpdateAuthorization(w http.ResponseWriter, r *http.R
 		return
 	}
 	if req.Name != "" {
-		_, _ = sa.db.Exec(`UPDATE `+tblAuthorizations+` SET name = ? WHERE id = ?`, req.Name, req.AuthID)
+		_, _ = sa.db.Exec(`UPDATE `+tblAuthorizations+` SET name = $1 WHERE id = $2`, req.Name, req.AuthID)
 	}
 	if req.Description != "" {
-		_, _ = sa.db.Exec(`UPDATE `+tblAuthorizations+` SET description = ? WHERE id = ?`, req.Description, req.AuthID)
+		_, _ = sa.db.Exec(`UPDATE `+tblAuthorizations+` SET description = $1 WHERE id = $2`, req.Description, req.AuthID)
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
@@ -3699,11 +3606,11 @@ func (sa *SecureAuth) handleDeleteAuthorization(w http.ResponseWriter, r *http.R
 	defer tx.Rollback()
 
 	_, _ = tx.Exec(
-		`UPDATE `+tblSharedKeys+` SET revoked_at = ?, revocation_reason = 'authorization deleted'
-		 WHERE authorization_id = ? AND revoked_at IS NULL`, now, req.AuthID,
+		`UPDATE `+tblSharedKeys+` SET revoked_at = $1, revocation_reason = 'authorization deleted'
+		 WHERE authorization_id = $2 AND revoked_at IS NULL`, now, req.AuthID,
 	)
-	_, _ = tx.Exec(`DELETE FROM `+tblAuthorizations+` WHERE id = ?`, req.AuthID)
-	_, _ = tx.Exec(`DELETE FROM `+tblRoleAuth+` WHERE authorization_id = ?`, req.AuthID)
+	_, _ = tx.Exec(`DELETE FROM `+tblAuthorizations+` WHERE id = $1`, req.AuthID)
+	_, _ = tx.Exec(`DELETE FROM `+tblRoleAuth+` WHERE authorization_id = $1`, req.AuthID)
 
 	if err := revokeStaleSharedKeysTx(tx, now); err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
@@ -3725,7 +3632,7 @@ func (sa *SecureAuth) userHasActiveKey(userID, authorizationID string) bool {
 	var count int
 	_ = sa.db.QueryRow(
 		`SELECT COUNT(*) FROM `+tblSharedKeys+`
-		 WHERE user_id = ? AND authorization_id = ? AND revoked_at IS NULL`,
+		 WHERE user_id = $1 AND authorization_id = $2 AND revoked_at IS NULL`,
 		userID, authorizationID,
 	).Scan(&count)
 	return count > 0
@@ -3796,7 +3703,7 @@ func (sa *SecureAuth) handleDataPut(w http.ResponseWriter, r *http.Request, sess
 
 	var existingAuthID string
 	err = tx.QueryRow(
-		`SELECT authorization_id FROM `+tblEncryptedData+` WHERE id = ?`, id,
+		`SELECT authorization_id FROM `+tblEncryptedData+` WHERE id = $1`, id,
 	).Scan(&existingAuthID)
 	if err == nil && existingAuthID != req.AuthorizationID {
 		http.Error(w, "conflict: id belongs to a different authorization", http.StatusConflict)
@@ -3810,11 +3717,13 @@ func (sa *SecureAuth) handleDataPut(w http.ResponseWriter, r *http.Request, sess
 	_, err = tx.Exec(
 		`INSERT INTO `+tblEncryptedData+`
 		 (id, authorization_id, owner_id, key_version, nonce, ciphertext, label, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-		 ON CONFLICT(id) DO UPDATE SET
-		   nonce=excluded.nonce, ciphertext=excluded.ciphertext,
-		   label=excluded.label, key_version=excluded.key_version,
-		   updated_at=excluded.updated_at`,
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+		 ON CONFLICT (id) DO UPDATE SET
+		   nonce = EXCLUDED.nonce,
+		   ciphertext = EXCLUDED.ciphertext,
+		   label = EXCLUDED.label,
+		   key_version = EXCLUDED.key_version,
+		   updated_at = EXCLUDED.updated_at`,
 		id, req.AuthorizationID, sess.UserID, req.KeyVersion, nonce, ct, req.Label, now, now,
 	)
 	if err != nil {
@@ -3851,7 +3760,7 @@ func (sa *SecureAuth) handleDataGet(w http.ResponseWriter, r *http.Request, sess
 	)
 	err := sa.db.QueryRow(
 		`SELECT authorization_id, key_version, nonce, ciphertext, label
-		 FROM `+tblEncryptedData+` WHERE id = ?`, req.ID,
+		 FROM `+tblEncryptedData+` WHERE id = $1`, req.ID,
 	).Scan(&authID, &keyVersion, &nonce, &ct, &label)
 	if err != nil {
 		http.Error(w, "not found", http.StatusNotFound)
@@ -3896,7 +3805,7 @@ func (sa *SecureAuth) handleDataDelete(w http.ResponseWriter, r *http.Request, s
 
 	var authID string
 	err = tx.QueryRow(
-		`SELECT authorization_id FROM `+tblEncryptedData+` WHERE id = ?`, req.ID,
+		`SELECT authorization_id FROM `+tblEncryptedData+` WHERE id = $1`, req.ID,
 	).Scan(&authID)
 	if err != nil {
 		http.Error(w, "not found", http.StatusNotFound)
@@ -3908,7 +3817,7 @@ func (sa *SecureAuth) handleDataDelete(w http.ResponseWriter, r *http.Request, s
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
-	_, _ = tx.Exec(`DELETE FROM `+tblEncryptedData+` WHERE id = ?`, req.ID)
+	_, _ = tx.Exec(`DELETE FROM `+tblEncryptedData+` WHERE id = $1`, req.ID)
 	if err := tx.Commit(); err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
@@ -3937,7 +3846,7 @@ func (sa *SecureAuth) handleDataList(w http.ResponseWriter, r *http.Request, ses
 	}
 	rows, err := sa.db.Query(
 		`SELECT id, label, key_version, updated_at FROM `+tblEncryptedData+`
-		 WHERE authorization_id = ? ORDER BY updated_at DESC`, req.AuthorizationID,
+		 WHERE authorization_id = $1 ORDER BY updated_at DESC`, req.AuthorizationID,
 	)
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
@@ -3973,12 +3882,6 @@ func (sa *SecureAuth) handleBootstrapCredentials(w http.ResponseWriter, r *http.
 		return
 	}
 
-	// The bootstrap password is a one-shot admin secret. Restrict its
-	// disclosure to loopback: on a fresh deployment an attacker who can
-	// reach the server before the legitimate operator would otherwise
-	// win the race and provision their own SuperAdmin account. Operators
-	// who expose the service on a public interface must retrieve the
-	// first-run credentials from the server log instead.
 	ip := sa.clientIP(r)
 	host, _, err := net.SplitHostPort(ip)
 	if err != nil {
@@ -4065,7 +3968,7 @@ func (sa *SecureAuth) handleBootstrapFirstUser(w http.ResponseWriter, r *http.Re
 
 	var signPubBytes []byte
 	err = sa.db.QueryRow(
-		`SELECT rsa_signing_public_key FROM `+tblUsers+` WHERE username = ?`,
+		`SELECT rsa_signing_public_key FROM `+tblUsers+` WHERE username = $1`,
 		sess.UserID,
 	).Scan(&signPubBytes)
 	if err != nil || len(signPubBytes) == 0 {
@@ -4103,13 +4006,13 @@ func (sa *SecureAuth) handleBootstrapFirstUser(w http.ResponseWriter, r *http.Re
 		}
 		_, _ = tx.Exec(
 			`DELETE FROM `+tblSharedKeys+`
-			 WHERE user_id = ? AND authorization_id = ? AND key_version = ?`,
+			 WHERE user_id = $1 AND authorization_id = $2 AND key_version = $3`,
 			sess.UserID, wk.AuthorizationID, wk.KeyVersion,
 		)
 		_, err = tx.Exec(
 			`INSERT INTO `+tblSharedKeys+`
 			 (user_id, authorization_id, wrapped_key, admin_signature, key_version, created_at)
-			 VALUES (?, ?, ?, ?, ?, ?)`,
+			 VALUES ($1, $2, $3, $4, $5, $6)`,
 			sess.UserID, wk.AuthorizationID, wrapped, sig, wk.KeyVersion, now,
 		)
 		if err != nil {
@@ -4333,7 +4236,7 @@ func importMapJSON() string {
 }
 
 // ---------------------------------------------------------------------------
-// Per-page module scripts
+// Per-page module scripts (unchanged from the SQLite version)
 // ---------------------------------------------------------------------------
 
 const sharedShellScript = `
@@ -4805,7 +4708,7 @@ func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 }
 
 // ---------------------------------------------------------------------------
-// Built-in default templates (unchanged except where noted)
+// Built-in default templates (unchanged from the SQLite version)
 // ---------------------------------------------------------------------------
 
 const defaultCSS = `
