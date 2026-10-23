@@ -184,7 +184,7 @@ func Init(dbdriver string, dsn string, opts InitOptions) (*SecureAuth, error) {
 	case opts.Debug:
 		h := sha256.Sum256([]byte("secureauth:debug:no-channel-binding:v1"))
 		sa.tlsEndPoint = h[:]
-		log.Printf("secureauth: DEBUG — no TLS certificate, using fixed channel binding")
+		log.Printf("secureauth: DEBUG - no TLS certificate, using fixed channel binding")
 	default:
 		return nil, errors.New("secureauth: TLSCertificate is required for channel binding")
 	}
@@ -305,6 +305,9 @@ func (sa *SecureAuth) createTables() error {
 			signing_key_salt BYTEA,
 			signing_key_kdf_info TEXT,
 			ksf_salt BYTEA,
+			totp_secret BYTEA,
+			totp_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+			totp_last_step BIGINT NOT NULL DEFAULT 0,
 			created_at TIMESTAMPTZ NOT NULL,
 			updated_at TIMESTAMPTZ NOT NULL
 		)`,
@@ -355,7 +358,7 @@ func (sa *SecureAuth) createTables() error {
 			paake_transcript_hash BYTEA,
 			client_ephemeral_public_key BYTEA,
 			server_ephemeral_public_key BYTEA,
-			totp_pending INTEGER NOT NULL DEFAULT 0
+			totp_pending BOOLEAN NOT NULL DEFAULT FALSE
 		)`,
 		`CREATE TABLE IF NOT EXISTS ` + tblAudit + ` (
 			id BIGSERIAL PRIMARY KEY,
@@ -439,9 +442,9 @@ func (sa *SecureAuth) createTables() error {
 		`ALTER TABLE ` + tblSessions + ` ADD COLUMN IF NOT EXISTS paake_transcript_hash BYTEA`,
 		`ALTER TABLE ` + tblServerKeys + ` ADD COLUMN IF NOT EXISTS opaque_server_key_material BYTEA`,
 		`ALTER TABLE ` + tblUsers + ` ADD COLUMN IF NOT EXISTS totp_secret BYTEA`,
-		`ALTER TABLE ` + tblUsers + ` ADD COLUMN IF NOT EXISTS totp_enabled INTEGER NOT NULL DEFAULT 0`,
-		`ALTER TABLE ` + tblUsers + ` ADD COLUMN IF NOT EXISTS totp_last_step INTEGER NOT NULL DEFAULT 0`,
-		`ALTER TABLE ` + tblSessions + ` ADD COLUMN IF NOT EXISTS totp_pending INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE ` + tblUsers + ` ADD COLUMN IF NOT EXISTS totp_enabled BOOLEAN NOT NULL DEFAULT FALSE`,
+		`ALTER TABLE ` + tblUsers + ` ADD COLUMN IF NOT EXISTS totp_last_step BIGINT NOT NULL DEFAULT 0`,
+		`ALTER TABLE ` + tblSessions + ` ADD COLUMN IF NOT EXISTS totp_pending BOOLEAN NOT NULL DEFAULT FALSE`,
 		`ALTER TABLE ` + tblLoginAttempts + ` ADD COLUMN IF NOT EXISTS purpose TEXT NOT NULL DEFAULT 'login'`,
 	}
 	for _, m := range migrations {
@@ -556,7 +559,7 @@ func (sa *SecureAuth) maybeProvisionFirstAdmin() error {
 		log.Printf("secureauth: *** FIRST-RUN CREDENTIALS (shown once) ***")
 		log.Printf("secureauth: admin username: %s", username)
 		log.Printf("secureauth: admin password: %s", password)
-		log.Printf("secureauth: *** store these securely — they will not be shown again ***")
+		log.Printf("secureauth: *** store these securely - they will not be shown again ***")
 	}
 
 	sealedPwd, err := sa.seal([]byte(password), []byte("secureauth:bootstrap-password:v1"))
@@ -605,7 +608,7 @@ func (sa *SecureAuth) maybeProvisionFirstAdmin() error {
 	_, err = sa.db.Exec(
 		`INSERT INTO `+tblBootstrap+`
 		 (id, username, sealed_password, sealed_masterkeys, consumed, created_at)
-		 VALUES (1, $1, $2, $3, 0, $4)
+		 VALUES (1, $1, $2, $3, false, $4)
 		 ON CONFLICT (id) DO UPDATE SET
 		   username = EXCLUDED.username,
 		   sealed_password = EXCLUDED.sealed_password,
@@ -1164,14 +1167,14 @@ func (sa *SecureAuth) sessionIsTOTPPending(sessionID string) bool {
 }
 
 func (sa *SecureAuth) userHasTOTP(username string) (bool, error) {
-	var enabled int
+	var enabled bool
 	err := sa.db.QueryRow(
 		`SELECT totp_enabled FROM `+tblUsers+` WHERE username = $1`, username,
 	).Scan(&enabled)
 	if err == sql.ErrNoRows {
 		return false, nil
 	}
-	return enabled == 1, err
+	return enabled, err
 }
 
 // ---------------------------------------------------------------------------
@@ -1392,7 +1395,7 @@ func (sa *SecureAuth) handleTOTPSetupFinish(w http.ResponseWriter, r *http.Reque
 
 	_, err = sa.db.Exec(
 		`UPDATE `+tblUsers+`
-		 SET totp_secret = $1, totp_enabled = 1, totp_last_step = $2
+		 SET totp_secret = $1, totp_enabled = TRUE, totp_last_step = $2
 		 WHERE username = $3`,
 		innerSealed, matchedStep, sess.UserID,
 	)
@@ -1401,7 +1404,7 @@ func (sa *SecureAuth) handleTOTPSetupFinish(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	_, _ = sa.db.Exec(
-		`UPDATE `+tblSessions+` SET totp_pending = 0 WHERE session_id = $1`, sess.SessionID,
+		`UPDATE `+tblSessions+` SET totp_pending = FALSE WHERE session_id = $1`, sess.SessionID,
 	)
 
 	sa.appendAudit(sess.UserID, "2fa.setup", "", "allow", ip, "")
@@ -1435,7 +1438,7 @@ func (sa *SecureAuth) handleTOTPVerify(w http.ResponseWriter, r *http.Request) {
 
 	var sealedSecret []byte
 	err = sa.db.QueryRow(
-		`SELECT totp_secret FROM `+tblUsers+` WHERE username = $1 AND totp_enabled = 1`,
+		`SELECT totp_secret FROM `+tblUsers+` WHERE username = $1 AND totp_enabled = TRUE`,
 		sess.UserID,
 	).Scan(&sealedSecret)
 	if err != nil {
@@ -1463,7 +1466,7 @@ func (sa *SecureAuth) handleTOTPVerify(w http.ResponseWriter, r *http.Request) {
 				Secure: true, HttpOnly: true, SameSite: http.SameSiteLaxMode,
 			})
 			sa.appendAudit(sess.UserID, "2fa.verify", "", "deny", ip,
-				"too many failures — session terminated")
+				"too many failures - session terminated")
 			http.Error(w, "too many failed attempts", http.StatusTooManyRequests)
 			return
 		}
@@ -1479,7 +1482,7 @@ func (sa *SecureAuth) handleTOTPVerify(w http.ResponseWriter, r *http.Request) {
 	}
 
 	_, _ = sa.db.Exec(
-		`UPDATE `+tblSessions+` SET totp_pending = 0 WHERE session_id = $1`, sess.SessionID,
+		`UPDATE `+tblSessions+` SET totp_pending = FALSE WHERE session_id = $1`, sess.SessionID,
 	)
 	sa.appendAudit(sess.UserID, "2fa.verify", "", "allow", ip, "")
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
@@ -1516,7 +1519,7 @@ func (sa *SecureAuth) handleTOTPDisable(w http.ResponseWriter, r *http.Request) 
 
 	var sealedSecret []byte
 	err = sa.db.QueryRow(
-		`SELECT totp_secret FROM `+tblUsers+` WHERE username = $1 AND totp_enabled = 1`,
+		`SELECT totp_secret FROM `+tblUsers+` WHERE username = $1 AND totp_enabled = TRUE`,
 		sess.UserID,
 	).Scan(&sealedSecret)
 	if err != nil {
@@ -1543,7 +1546,7 @@ func (sa *SecureAuth) handleTOTPDisable(w http.ResponseWriter, r *http.Request) 
 				Secure: true, HttpOnly: true, SameSite: http.SameSiteLaxMode,
 			})
 			sa.appendAudit(sess.UserID, "2fa.disable", "", "deny", ip,
-				"too many failures — session terminated")
+				"too many failures - session terminated")
 			http.Error(w, "too many failed attempts", http.StatusTooManyRequests)
 			return
 		}
@@ -1559,7 +1562,7 @@ func (sa *SecureAuth) handleTOTPDisable(w http.ResponseWriter, r *http.Request) 
 	}
 
 	_, err = sa.db.Exec(
-		`UPDATE `+tblUsers+` SET totp_secret = NULL, totp_enabled = 0, totp_last_step = 0 WHERE username = $1`,
+		`UPDATE `+tblUsers+` SET totp_secret = NULL, totp_enabled = FALSE, totp_last_step = 0 WHERE username = $1`,
 		sess.UserID,
 	)
 	if err != nil {
@@ -1888,7 +1891,7 @@ func (sa *SecureAuth) loadSessionInfo(r *http.Request) (*sessionInfo, error) {
 		keyCipher   []byte
 		csrf        string
 		expires     time.Time
-		totpPending int
+		totpPending bool
 	)
 	err := sa.db.QueryRow(
 		`SELECT user_id, session_key_ciphertext, csrf_token, expires_at, totp_pending
@@ -1911,7 +1914,7 @@ func (sa *SecureAuth) loadSessionInfo(r *http.Request) (*sessionInfo, error) {
 		Key:         key,
 		CSRF:        csrf,
 		ExpiresAt:   expires,
-		TOTPPending: totpPending == 1,
+		TOTPPending: totpPending,
 	}, nil
 }
 
@@ -2576,11 +2579,11 @@ func (sa *SecureAuth) finishLogin2(w http.ResponseWriter, r *http.Request, purpo
 	}
 
 	totpRequired := totpEnabled || (sa.require2FA && !isBootstrapAdmin)
-	totpPendingInt := 0
+	totpPending := false
 	if totpEnabled {
-		totpPendingInt = 1
+		totpPending = true
 	} else if sa.require2FA && !isBootstrapAdmin {
-		totpPendingInt = 1
+		totpPending = true
 	}
 
 	csrfToken, csrfCookie := sa.newCSRF(sessionID)
@@ -2595,7 +2598,7 @@ func (sa *SecureAuth) finishLogin2(w http.ResponseWriter, r *http.Request, purpo
 		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
 		sessionID, username, sessionKeyEnc, csrfToken,
 		time.Now().UTC(), expiresAt, transcriptHash, clientEph, serverEphPub,
-		totpPendingInt,
+		totpPending,
 	)
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
@@ -4545,7 +4548,7 @@ const authsPageScript = sharedShellScript + `
     '<input id="sa-data-id" placeholder="record id"> ' +
     '<button id="sa-data-get">Fetch &amp; decrypt</button> ' +
     '<button id="sa-data-del">Delete</button> ' +
-    '<button id="sa-data-list">List</button>' +
+    '<button id="sa-data-list">List</button> ' +
     '<pre id="sa-data-out"></pre>';
   document.body.appendChild(container);
 
