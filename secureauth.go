@@ -406,7 +406,7 @@ func (sa *SecureAuth) createTables() error {
 			username TEXT NOT NULL,
 			sealed_password BYTEA NOT NULL,
 			sealed_masterkeys BYTEA,
-			consumed INTEGER NOT NULL DEFAULT 0,
+			consumed BOOLEAN NOT NULL DEFAULT FALSE,
 			created_at TIMESTAMPTZ NOT NULL
 		)`,
 		`CREATE TABLE IF NOT EXISTS ` + tblTOTPChallenges + ` (
@@ -420,7 +420,7 @@ func (sa *SecureAuth) createTables() error {
 			user_id TEXT NOT NULL,
 			created_at TIMESTAMPTZ NOT NULL,
 			expires_at TIMESTAMPTZ NOT NULL,
-			used INTEGER NOT NULL DEFAULT 0
+			used BOOLEAN NOT NULL DEFAULT FALSE
 		)`,
 	}
 	for _, s := range stmts {
@@ -535,12 +535,12 @@ func (sa *SecureAuth) maybeProvisionFirstAdmin() error {
 		username TEXT NOT NULL,
 		sealed_password BYTEA NOT NULL,
 		sealed_masterkeys BYTEA,
-		consumed INTEGER NOT NULL DEFAULT 0,
+		consumed BOOLEAN NOT NULL DEFAULT FALSE,
 		created_at TIMESTAMPTZ NOT NULL
 	)`)
 
 	var bsCount int
-	_ = sa.db.QueryRow(`SELECT COUNT(*) FROM ` + tblBootstrap + ` WHERE id = 1 AND consumed = 0`).Scan(&bsCount)
+	_ = sa.db.QueryRow(`SELECT COUNT(*) FROM ` + tblBootstrap + ` WHERE id = 1 AND consumed = FALSE`).Scan(&bsCount)
 	if bsCount > 0 {
 		return nil
 	}
@@ -805,7 +805,7 @@ func (sa *SecureAuth) gcExpiredRows() {
 			_, _ = sa.db.Exec(`DELETE FROM `+tblTOTPChallenges+` WHERE expires_at < $1`, now)
 			_, _ = sa.db.Exec(`DELETE FROM `+tblPendingRegs+` WHERE expires_at < $1`, now)
 			_, _ = sa.db.Exec(
-				`DELETE FROM `+tblReauthTokens+` WHERE expires_at < $1 OR used = 1`,
+				`DELETE FROM `+tblReauthTokens+` WHERE expires_at < $1 OR used = TRUE`,
 				now,
 			)
 			_, _ = sa.db.Exec(`DELETE FROM `+tblSessions+` WHERE expires_at < $1`, now)
@@ -995,7 +995,7 @@ func (sa *SecureAuth) RegisterRoleByName(name, description string, authorization
 }
 
 func (sa *SecureAuth) addBootstrapMasterkeyTx(tx *sql.Tx, authID string) error {
-	var consumed int
+	var consumed bool
 	var sealedMK []byte
 	err := tx.QueryRow(
 		`SELECT consumed, sealed_masterkeys FROM `+tblBootstrap+` WHERE id = 1`,
@@ -1006,7 +1006,7 @@ func (sa *SecureAuth) addBootstrapMasterkeyTx(tx *sql.Tx, authID string) error {
 	if err != nil {
 		return fmt.Errorf("secureauth: addBootstrapMasterkeyTx: load bootstrap record: %w", err)
 	}
-	if consumed != 0 {
+	if consumed {
 		return nil
 	}
 
@@ -1159,11 +1159,11 @@ func totpProvisioningURI(secret []byte, username, issuer string) string {
 }
 
 func (sa *SecureAuth) sessionIsTOTPPending(sessionID string) bool {
-	var pending int
+	var pending bool
 	_ = sa.db.QueryRow(
 		`SELECT totp_pending FROM `+tblSessions+` WHERE session_id = $1`, sessionID,
 	).Scan(&pending)
-	return pending == 1
+	return pending
 }
 
 func (sa *SecureAuth) userHasTOTP(username string) (bool, error) {
@@ -1187,7 +1187,7 @@ func (sa *SecureAuth) issueReauthToken(userID string) (string, error) {
 	_, err := sa.db.Exec(
 		`INSERT INTO `+tblReauthTokens+`
 		 (token, user_id, created_at, expires_at, used)
-		 VALUES ($1, $2, $3, $4, 0)`,
+		 VALUES ($1, $2, $3, $4, FALSE)`,
 		token, userID, now, now.Add(5*time.Minute),
 	)
 	if err != nil {
@@ -1203,7 +1203,7 @@ func (sa *SecureAuth) checkReauthToken(userID, token string) bool {
 	var one int
 	err := sa.db.QueryRow(
 		`SELECT 1 FROM `+tblReauthTokens+`
-		 WHERE token = $1 AND user_id = $2 AND used = 0 AND expires_at > $3`,
+		 WHERE token = $1 AND user_id = $2 AND used = FALSE AND expires_at > $3`,
 		token, userID, time.Now().UTC(),
 	).Scan(&one)
 	return err == nil
@@ -1211,8 +1211,8 @@ func (sa *SecureAuth) checkReauthToken(userID, token string) bool {
 
 func (sa *SecureAuth) consumeReauthToken(userID, token string) {
 	_, _ = sa.db.Exec(
-		`UPDATE `+tblReauthTokens+` SET used = 1
-		 WHERE token = $1 AND user_id = $2 AND used = 0`,
+		`UPDATE `+tblReauthTokens+` SET used = TRUE
+		 WHERE token = $1 AND user_id = $2 AND used = FALSE`,
 		token, userID,
 	)
 }
@@ -2568,12 +2568,12 @@ func (sa *SecureAuth) finishLogin2(w http.ResponseWriter, r *http.Request, purpo
 
 	isBootstrapAdmin := false
 	{
-		var consumed int
+		var consumed bool
 		var bUser string
 		err := sa.db.QueryRow(
 			`SELECT consumed, username FROM `+tblBootstrap+` WHERE id = 1`,
 		).Scan(&consumed, &bUser)
-		if err == nil && consumed == 0 && bUser == username {
+		if err == nil && !consumed && bUser == username {
 			isBootstrapAdmin = true
 		}
 	}
@@ -3910,11 +3910,11 @@ func (sa *SecureAuth) handleBootstrapCredentials(w http.ResponseWriter, r *http.
 
 	var username string
 	var sealedPwd []byte
-	var consumed int
+	var consumed bool
 	err = sa.db.QueryRow(
 		`SELECT username, sealed_password, consumed FROM `+tblBootstrap+` WHERE id = 1`,
 	).Scan(&username, &sealedPwd, &consumed)
-	if err != nil || consumed != 0 {
+	if err != nil || consumed {
 		notAvailable()
 		return
 	}
@@ -3947,11 +3947,11 @@ func (sa *SecureAuth) handleBootstrapFirstUser(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	var consumed int
+	var consumed bool
 	err = sa.db.QueryRow(
 		`SELECT consumed FROM ` + tblBootstrap + ` WHERE id = 1`,
 	).Scan(&consumed)
-	if err != nil || consumed != 0 {
+	if err != nil || consumed {
 		http.Error(w, "bootstrap already completed", http.StatusGone)
 		return
 	}
@@ -4024,7 +4024,7 @@ func (sa *SecureAuth) handleBootstrapFirstUser(w http.ResponseWriter, r *http.Re
 		}
 	}
 
-	_, _ = tx.Exec(`UPDATE ` + tblBootstrap + ` SET consumed = 1 WHERE id = 1`)
+	_, _ = tx.Exec(`UPDATE ` + tblBootstrap + ` SET consumed = TRUE WHERE id = 1`)
 
 	if err := tx.Commit(); err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
@@ -4048,12 +4048,12 @@ func (sa *SecureAuth) handleBootstrapMasterkeysPending(w http.ResponseWriter, r 
 		return
 	}
 
-	var consumed int
+	var consumed bool
 	var sealedMK []byte
 	err = sa.db.QueryRow(
 		`SELECT consumed, sealed_masterkeys FROM `+tblBootstrap+` WHERE id = 1`,
 	).Scan(&consumed, &sealedMK)
-	if err != nil || consumed != 0 {
+	if err != nil || consumed {
 		http.Error(w, "not available", http.StatusGone)
 		return
 	}
